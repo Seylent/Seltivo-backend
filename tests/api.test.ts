@@ -18,11 +18,12 @@ test('registration, ownership, idempotent requests, chat and admin status', asyn
   };
   const user = async (name: string) => {
     const email = `${name}@example.test`;
-    assert.equal((await call('POST', '/api/v1/auth/register', { email, password: 'VeryStrongPass123!', name })).status, 201);
-    const token = sent.at(-1)!.text.split('token=')[1];
-    assert.equal((await call('POST', '/api/v1/auth/verify-email', { token })).status, 200);
+    const registration = await call('POST', '/api/v1/auth/register', { email, password: 'VeryStrongPass123!', name });
+    assert.equal(registration.status, 201);
+    assert.equal(registration.body.verificationRequired, false);
     const login = await call('POST', '/api/v1/auth/login', { email, password: 'VeryStrongPass123!' });
     assert.equal(login.status, 200);
+    assert.equal(login.body.user.emailVerified, true);
     return login.cookie!.split(';')[0];
   };
   try {
@@ -37,6 +38,9 @@ test('registration, ownership, idempotent requests, chat and admin status', asyn
     assert.equal(first.status, 201);
     const saved = await call('GET', `/api/v1/requests/${first.body.id}`, undefined, alice);
     assert.equal(saved.body.configuration.name, 'Brand');
+    const updated = await call('PATCH', `/api/v1/configurations/${config.body.id}`, { name: 'Оновлений сайт', data: { id: 'brand', name: 'Updated', colors: {}, hero: {}, home: {}, products: [] } }, alice, { 'if-match': '1' });
+    assert.equal(updated.body.revision, 2);
+    assert.equal((await call('GET', `/api/v1/requests/${first.body.id}`, undefined, alice)).body.configuration.name, 'Brand');
     assert.equal((await call('GET', `/api/v1/requests/${first.body.id}`, undefined, bob)).status, 404);
     assert.equal((await call('POST', `/api/v1/requests/${first.body.id}/messages`, { body: 'Hi', clientMessageId: randomUUID() }, bob)).status, 404);
     const messageKey = randomUUID();
@@ -50,6 +54,11 @@ test('registration, ownership, idempotent requests, chat and admin status', asyn
     db.prepare("INSERT INTO users(id,email,password_hash,role,name,email_verified_at,created_at,updated_at) VALUES (?,?,?,'admin','Admin',?,?,?)")
       .run(adminId, 'admin@example.test', await hashPassword('VeryStrongPass123!'), timestamp, timestamp, timestamp);
     const admin = (await call('POST', '/api/v1/auth/login', { email: 'admin@example.test', password: 'VeryStrongPass123!' })).cookie!.split(';')[0];
+    const customersPage = await call('GET', '/api/v1/admin/customers?limit=1', undefined, admin);
+    assert.equal(customersPage.body.items.length, 1);
+    assert.equal(customersPage.body.nextOffset, 1);
+    assert.equal((await call('GET', '/api/v1/admin/customers?limit=1&offset=1', undefined, admin)).body.items.length, 1);
+    assert.equal((await call('GET', '/api/v1/requests?limit=1', undefined, alice)).body.items[0].id, first.body.id);
     assert.equal((await call('GET', '/api/v1/notifications/unread-count', undefined, admin)).body.total, 1);
     assert.equal((await call('PATCH', `/api/v1/requests/${first.body.id}/read`, { lastSeenMessageId: message.body.id }, admin)).status, 204);
     assert.equal((await call('GET', '/api/v1/notifications/unread-count', undefined, admin)).body.total, 0);

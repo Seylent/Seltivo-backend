@@ -5,3 +5,5 @@ data/
 *.db
 *.db-wal
 *.db-shm
+.wrangler/
+.seltivo-admin-initial-password

@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto';
-import Fastify, { type FastifyReply, type FastifyRequest } from 'fastify';
+import Fastify, { type FastifyInstance, type FastifyReply, type FastifyRequest } from 'fastify';
 import { z } from 'zod';
 import type { SeltivoDb } from './db.js';
 import { actorFromRequest, audit, clearSessionCookie, createSession, hashPassword, hashToken, newAuthToken, normalizeEmail, now, sessionCookie, verifyPassword, type Actor } from './auth.js';
@@ -21,7 +21,7 @@ const datePlus = (ms: number) => new Date(Date.now() + ms).toISOString();
 const fail = (reply: FastifyReply, status: number, error: string) => reply.code(status).send({ error });
 
 type Mail = (to: string, subject: string, text: string) => Promise<void>;
-export type AppOptions = { db: SeltivoDb; origin: string; secureCookies?: boolean; sendMail?: Mail; teamEmail?: string };
+export type AppOptions = { db: SeltivoDb; origin: string; secureCookies?: boolean; sendMail?: Mail; teamEmail?: string; logger?: boolean; router?: FastifyInstance };
 
 function parse<T>(schema: z.ZodType<T>, body: unknown, reply: FastifyReply): T | null {
   const result = schema.safeParse(body);
@@ -54,8 +54,8 @@ function configJson(value: unknown): string | null {
   return walk(value, 0) ? json : null;
 }
 
-export function buildApp({ db, origin, secureCookies = false, sendMail, teamEmail }: AppOptions) {
-  const app = Fastify({ logger: process.env.NODE_ENV !== 'test', bodyLimit: 9 * 1024 * 1024, trustProxy: process.env.SELTIVO_TRUST_PROXY === '1' });
+export function buildApp({ db, origin, secureCookies = false, sendMail, teamEmail, logger = process.env.NODE_ENV !== 'test', router }: AppOptions) {
+  const app = router ?? Fastify({ logger, bodyLimit: 9 * 1024 * 1024, trustProxy: process.env.SELTIVO_TRUST_PROXY === '1' });
   const attempts = new Map<string, number[]>();
   const mail = async (to: string, subject: string, text: string) => {
     if (!sendMail) return;
@@ -101,7 +101,6 @@ export function buildApp({ db, origin, secureCookies = false, sendMail, teamEmai
   app.get('/api/v1/health', async () => ({ ok: db.pragma('quick_check', { simple: true }) === 'ok' }));
 
   app.post('/api/v1/auth/register', async (request, reply) => {
-    if (!sendMail) return fail(reply, 503, 'Пошту ще не налаштовано.');
     const body = parse(z.object({ email, password, name: z.string().trim().min(2).max(80) }).strict(), request.body, reply);
     if (!body) return;
     const normalized = normalizeEmail(body.email);
@@ -110,15 +109,13 @@ export function buildApp({ db, origin, secureCookies = false, sendMail, teamEmai
     const timestamp = now();
     const hash = await hashPassword(body.password);
     try {
-      db.prepare(`INSERT INTO users(id,email,password_hash,role,name,created_at,updated_at) VALUES (?,?,?,'customer',?,?,?)`)
-        .run(userId, normalized, hash, body.name, timestamp, timestamp);
+      db.prepare(`INSERT INTO users(id,email,password_hash,role,name,email_verified_at,created_at,updated_at) VALUES (?,?,?,'customer',?,?,?,?)`)
+        .run(userId, normalized, hash, body.name, timestamp, timestamp, timestamp);
     } catch (error) {
       if (error instanceof Error && error.message.includes('UNIQUE constraint failed: users.email')) return fail(reply, 409, 'Акаунт із цим email уже існує.');
       throw error;
     }
-    const token = newAuthToken(db, userId, 'verify', 24 * 60 * 60 * 1000);
-    await mail(normalized, 'Підтвердьте email SELTIVO', `${origin}/verify-email?token=${token}`);
-    return reply.code(201).send({ id: userId, verificationRequired: true });
+    return reply.code(201).send({ id: userId, verificationRequired: false });
   });
   app.post('/api/v1/auth/resend-verification', async (request, reply) => {
     const body = parse(z.object({ email }).strict(), request.body, reply);
@@ -190,6 +187,21 @@ export function buildApp({ db, origin, secureCookies = false, sendMail, teamEmai
     const body = parse(z.object({ name: z.string().trim().min(2).max(80), phone: z.string().trim().max(40).nullable(), telegram: z.string().trim().max(80).nullable() }).strict(), request.body, reply);
     if (!body) return;
     db.prepare('UPDATE users SET name=?,phone=?,telegram=?,updated_at=? WHERE id=?').run(body.name, body.phone, body.telegram, now(), actor.id);
+    return { ok: true };
+  });
+  app.post('/api/v1/auth/change-password', async (request, reply) => {
+    const actor = auth(request, reply); if (!actor) return;
+    const body = parse(z.object({ currentPassword: z.string(), newPassword: password }).strict(), request.body, reply);
+    if (!body) return;
+    const row = db.prepare('SELECT password_hash FROM users WHERE id=?').get(actor.id) as { password_hash: string };
+    if (!await verifyPassword(body.currentPassword, row.password_hash)) return fail(reply, 401, 'Невірний поточний пароль.');
+    if (body.currentPassword === body.newPassword) return fail(reply, 422, 'Новий пароль має відрізнятися.');
+    const hash = await hashPassword(body.newPassword);
+    db.transaction(() => {
+      db.prepare('UPDATE users SET password_hash=?,updated_at=? WHERE id=?').run(hash, now(), actor.id);
+      db.prepare('DELETE FROM sessions WHERE user_id=?').run(actor.id);
+    })();
+    reply.header('Set-Cookie', clearSessionCookie(secureCookies));
     return { ok: true };
   });
 

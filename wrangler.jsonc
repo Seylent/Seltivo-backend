@@ -1,0 +1,17 @@
+{
+  "$schema": "./node_modules/wrangler/config-schema.json",
+  "name": "seltivo-api",
+  "account_id": "642a1378267910de72f484b86dd6eb73",
+  "main": "./cloudflare/worker.ts",
+  "compatibility_date": "2026-11-14",
+  "workers_dev": true,
+  "vars": {
+    "SELTIVO_PUBLIC_ORIGIN": "https://seltivo.seltivostudio.workers.dev",
+    "SELTIVO_ADMIN_EMAIL": "seltivostudio@gmail.com"
+  },
+  "durable_objects": {
+    "bindings": [{ "name": "SELTIVO", "class_name": "SeltivoData" }]
+  },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["SeltivoData"] }],
+  "observability": { "enabled": true }
+}
