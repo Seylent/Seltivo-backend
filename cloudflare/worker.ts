@@ -3,14 +3,18 @@ import { randomUUID } from 'node:crypto';
 import { buildApp } from '../src/app.js';
 import { openCloudflareDatabase } from '../src/cloudflare-db.js';
 import { createWorkerRouter } from './worker-router.js';
+import { purgeCustomer } from '../src/delete-account.js';
+export { DeletionLedger } from './deletion-ledger.js';
 
 interface Env {
   SELTIVO: DurableObjectNamespace;
+  SELTIVO_DELETIONS: DurableObjectNamespace;
   SELTIVO_PUBLIC_ORIGIN: string;
   SELTIVO_ADMIN_EMAIL: string;
   SELTIVO_ADMIN_PASSWORD_HASH?: string;
   BREVO_API_KEY?: string;
   BREVO_SENDER_EMAIL?: string;
+  SELTIVO_ACCOUNT_DELETION_ENABLED?: string;
 }
 
 function brevoMail(env: Env) {
@@ -39,6 +43,13 @@ export class SeltivoData extends DurableObject<Env> {
     const localOrigin = /^http:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/.test(env.SELTIVO_PUBLIC_ORIGIN ?? '');
     if (!env.SELTIVO_PUBLIC_ORIGIN?.startsWith('https://') && !localOrigin) throw new Error('SELTIVO_PUBLIC_ORIGIN must be HTTPS outside local development');
     const db = openCloudflareDatabase(ctx.storage);
+    const ledger = env.SELTIVO_DELETIONS.get(env.SELTIVO_DELETIONS.idFromName('primary'));
+    ctx.blockConcurrencyWhile(async () => {
+      const response = await ledger.fetch('https://ledger.internal/deletions');
+      if (!response.ok) throw new Error('Deletion ledger unavailable');
+      const { ids } = await response.json() as { ids: string[] };
+      for (const id of ids) purgeCustomer(db, id);
+    });
     if (env.SELTIVO_ADMIN_PASSWORD_HASH) {
       const timestamp = new Date().toISOString();
       db.prepare(`INSERT OR IGNORE INTO users(id,email,password_hash,role,name,email_verified_at,created_at,updated_at)
@@ -54,6 +65,18 @@ export class SeltivoData extends DurableObject<Env> {
       sendMail: brevoMail(env),
       teamEmail: env.SELTIVO_ADMIN_EMAIL,
       databaseBytes: () => ctx.storage.sql.databaseSize,
+      deleteCustomer: env.SELTIVO_ACCOUNT_DELETION_ENABLED === '1' ? async (userId) => {
+        try {
+          const response = await ledger.fetch(new Request('https://ledger.internal/deletions', {
+            method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ id: userId }),
+          }));
+          if (!response.ok) throw new Error('Deletion ledger unavailable');
+          purgeCustomer(db, userId);
+        } catch (error) {
+          ctx.abort();
+          throw error;
+        }
+      } : undefined,
     });
   }
 
@@ -76,7 +99,7 @@ export class SeltivoData extends DurableObject<Env> {
     headers.set('X-Request-Id', requestId);
     console.log(JSON.stringify({ event: 'api_request', requestId, method: request.method,
       status: result.statusCode, durationMs: Date.now() - started, databaseBytes: this.ctx.storage.sql.databaseSize }));
-    return new Response(result.rawPayload, { status: result.statusCode, headers });
+    return new Response(result.statusCode === 204 ? null : result.rawPayload, { status: result.statusCode, headers });
   }
 }
 

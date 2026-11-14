@@ -21,7 +21,7 @@ const datePlus = (ms: number) => new Date(Date.now() + ms).toISOString();
 const fail = (reply: FastifyReply, status: number, error: string) => reply.code(status).send({ error });
 
 type Mail = (to: string, subject: string, text: string) => Promise<void>;
-export type AppOptions = { db: SeltivoDb; origin: string; secureCookies?: boolean; sendMail?: Mail; teamEmail?: string; databaseBytes?: () => number; logger?: boolean; router?: FastifyInstance };
+export type AppOptions = { db: SeltivoDb; origin: string; secureCookies?: boolean; sendMail?: Mail; teamEmail?: string; databaseBytes?: () => number; deleteCustomer?: (userId: string) => Promise<void>; logger?: boolean; router?: FastifyInstance };
 
 function parse<T>(schema: z.ZodType<T>, body: unknown, reply: FastifyReply): T | null {
   const result = schema.safeParse(body);
@@ -54,7 +54,7 @@ function configJson(value: unknown): string | null {
   return walk(value, 0) ? json : null;
 }
 
-export function buildApp({ db, origin, secureCookies = false, sendMail, teamEmail, databaseBytes, logger = process.env.NODE_ENV !== 'test', router }: AppOptions) {
+export function buildApp({ db, origin, secureCookies = false, sendMail, teamEmail, databaseBytes, deleteCustomer, logger = process.env.NODE_ENV !== 'test', router }: AppOptions) {
   const app = router ?? Fastify({ logger, bodyLimit: 9 * 1024 * 1024, trustProxy: process.env.SELTIVO_TRUST_PROXY === '1' });
   const attempts = new Map<string, number[]>();
   const mail = async (to: string, subject: string, text: string) => {
@@ -209,7 +209,8 @@ export function buildApp({ db, origin, secureCookies = false, sendMail, teamEmai
   app.get('/api/v1/me', async (request, reply) => {
     const actor = auth(request, reply); if (!actor) return;
     const row = db.prepare('SELECT id,email,role,name,phone,telegram,email_verified_at FROM users WHERE id=?').get(actor.id) as any;
-    return { id: row.id, email: row.email, role: row.role, name: row.name, phone: row.phone, telegram: row.telegram, emailVerified: Boolean(row.email_verified_at) };
+    return { id: row.id, email: row.email, role: row.role, name: row.name, phone: row.phone, telegram: row.telegram,
+      emailVerified: Boolean(row.email_verified_at), accountDeletionAvailable: actor.role === 'customer' && Boolean(deleteCustomer) };
   });
   app.patch('/api/v1/me', async (request, reply) => {
     const actor = auth(request, reply); if (!actor) return;
@@ -217,6 +218,16 @@ export function buildApp({ db, origin, secureCookies = false, sendMail, teamEmai
     if (!body) return;
     db.prepare('UPDATE users SET name=?,phone=?,telegram=?,updated_at=? WHERE id=?').run(body.name, body.phone, body.telegram, now(), actor.id);
     return { ok: true };
+  });
+  app.delete('/api/v1/me', async (request, reply) => {
+    const actor = auth(request, reply, 'customer'); if (!actor) return;
+    if (!deleteCustomer) return fail(reply, 503, 'Видалення акаунта тимчасово недоступне.');
+    const body = parse(z.object({ password }).strict(), request.body, reply); if (!body) return;
+    const row = db.prepare('SELECT password_hash FROM users WHERE id=?').get(actor.id) as { password_hash: string };
+    if (!await verifyPassword(body.password, row.password_hash)) return fail(reply, 401, 'Невірний пароль.');
+    await deleteCustomer(actor.id);
+    reply.header('Set-Cookie', clearSessionCookie(secureCookies));
+    return reply.code(204).send();
   });
   app.post('/api/v1/auth/change-password', async (request, reply) => {
     const actor = auth(request, reply); if (!actor) return;

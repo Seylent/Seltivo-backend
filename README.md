@@ -42,7 +42,7 @@ Remove-Item Env:SELTIVO_ADMIN_PASSWORD
 | Health | `GET /health` |
 | Реєстрація, верифікація, вхід, вихід | `POST /auth/register`, `/auth/resend-verification`, `/auth/verify-email`, `/auth/login`, `/auth/logout` |
 | Відновлення пароля | `POST /auth/forgot-password`, `/auth/reset-password` |
-| Профіль | `GET/PATCH /me` |
+| Профіль | `GET/PATCH/DELETE /me` |
 | Збережені конфігурації | `GET/POST /configurations`, `GET/PATCH/DELETE /configurations/:id` |
 | Заявки | `GET/POST /requests`, `GET /requests/:id` |
 | Чат | `GET/POST /requests/:id/messages`, `PATCH /requests/:id/read`, `GET /notifications/unread-count` |
@@ -52,7 +52,7 @@ Remove-Item Env:SELTIVO_ADMIN_PASSWORD
 
 Конфігурація зберігається як JSON до 8 МБ; до 30 зображень PNG/JPEG/WebP можуть бути вкладені як data URL. Створена заявка отримує окремий знімок конфігурації, тому подальше редагування або приховування збереженого варіанта не змінює історію заявки. Діалог оновлюється запитами з інтервалом, WebSocket і вкладень у v1 немає. Повідомлення про відповідь адміністратора надсилається email; помилка доставки не видаляє повідомлення з діалогу.
 
-`DELETE /configurations/:id` приховує збережений варіант, але не стирає знімок у вже створених заявках. Для повного видалення акаунта погоджено прибирати також заявки й чат з активної БД; реалізація чекає захищеного журналу видалень поза Durable Object, щоб старе відновлення не повернуло дані. Строк даних у вже створених копіях — до 30 днів.
+`DELETE /configurations/:id` приховує збережений варіант, але не стирає знімок у вже створених заявках. `DELETE /me` видаляє клієнтський акаунт разом із заявками й чатом після перевірки пароля. У Worker окремий Durable Object зберігає журнал ID видалень і повторно застосовує їх після PITR. Функція вимкнена за замовчуванням до пробного restore на staging; порядок увімкнення — у [Cloudflare operations](docs/cloudflare-operations.md). Строк даних у вже створених копіях — до 30 днів.
 
 ## Перевірки
 

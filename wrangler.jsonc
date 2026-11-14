@@ -10,8 +10,14 @@
     "SELTIVO_ADMIN_EMAIL": "seltivostudio@gmail.com"
   },
   "durable_objects": {
-    "bindings": [{ "name": "SELTIVO", "class_name": "SeltivoData" }]
+    "bindings": [
+      { "name": "SELTIVO", "class_name": "SeltivoData" },
+      { "name": "SELTIVO_DELETIONS", "class_name": "DeletionLedger" }
+    ]
   },
-  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["SeltivoData"] }],
+  "migrations": [
+    { "tag": "v1", "new_sqlite_classes": ["SeltivoData"] },
+    { "tag": "v2", "new_sqlite_classes": ["DeletionLedger"] }
+  ],
   "observability": { "enabled": true }
 }
