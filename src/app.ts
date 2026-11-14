@@ -21,7 +21,7 @@ const datePlus = (ms: number) => new Date(Date.now() + ms).toISOString();
 const fail = (reply: FastifyReply, status: number, error: string) => reply.code(status).send({ error });
 
 type Mail = (to: string, subject: string, text: string) => Promise<void>;
-export type AppOptions = { db: SeltivoDb; origin: string; secureCookies?: boolean; sendMail?: Mail; teamEmail?: string; logger?: boolean; router?: FastifyInstance };
+export type AppOptions = { db: SeltivoDb; origin: string; secureCookies?: boolean; sendMail?: Mail; teamEmail?: string; databaseBytes?: () => number; logger?: boolean; router?: FastifyInstance };
 
 function parse<T>(schema: z.ZodType<T>, body: unknown, reply: FastifyReply): T | null {
   const result = schema.safeParse(body);
@@ -54,12 +54,41 @@ function configJson(value: unknown): string | null {
   return walk(value, 0) ? json : null;
 }
 
-export function buildApp({ db, origin, secureCookies = false, sendMail, teamEmail, logger = process.env.NODE_ENV !== 'test', router }: AppOptions) {
+export function buildApp({ db, origin, secureCookies = false, sendMail, teamEmail, databaseBytes, logger = process.env.NODE_ENV !== 'test', router }: AppOptions) {
   const app = router ?? Fastify({ logger, bodyLimit: 9 * 1024 * 1024, trustProxy: process.env.SELTIVO_TRUST_PROXY === '1' });
   const attempts = new Map<string, number[]>();
   const mail = async (to: string, subject: string, text: string) => {
     if (!sendMail) return;
-    try { await sendMail(to, subject, text); } catch (error) { app.log.error({ error }, 'mail delivery failed'); }
+    try { await sendMail(to, subject, text); } catch { app.log.error({ event: 'email_delivery_failed', kind: 'auth' }); }
+  };
+  const deliverNotification = async (notificationId: string): Promise<'sent' | 'failed' | 'busy' | 'missing'> => {
+    const started = now();
+    const stale = new Date(Date.now() - 2 * 60_000).toISOString();
+    const claimed = db.prepare(`UPDATE email_notifications SET status='sending',attempts=attempts+1,last_attempt_at=?,last_error_code=NULL
+      WHERE id=? AND (status IN ('pending','failed') OR (status='sending' AND last_attempt_at<?))`).run(started, notificationId, stale);
+    if (!claimed.changes) {
+      const row = db.prepare('SELECT status FROM email_notifications WHERE id=?').get(notificationId) as { status: string } | undefined;
+      return row ? 'busy' : 'missing';
+    }
+    const row = db.prepare(`SELECT n.recipient,r.id request_id,u.role sender_role FROM email_notifications n
+      JOIN messages m ON m.id=n.message_id JOIN users u ON u.id=m.sender_id
+      JOIN conversations c ON c.id=m.conversation_id JOIN requests r ON r.id=c.request_id WHERE n.id=?`)
+      .get(notificationId) as { recipient: string; request_id: string; sender_role: string } | undefined;
+    if (!row) return 'missing';
+    const customer = row.sender_role === 'admin';
+    const subject = customer ? 'Нова відповідь SELTIVO' : 'Нове повідомлення клієнта SELTIVO';
+    const text = `${customer ? 'Нова відповідь' : 'Нове повідомлення'} у заявці ${row.request_id}: ${origin}/${customer ? 'account' : 'admin'}/requests/${row.request_id}`;
+    try {
+      if (!sendMail) throw new Error('mail_not_configured');
+      await sendMail(row.recipient, subject, text);
+      db.prepare("UPDATE email_notifications SET status='sent',sent_at=?,last_error_code=NULL WHERE id=?").run(now(), notificationId);
+      return 'sent';
+    } catch {
+      const code = sendMail ? 'provider_error' : 'mail_not_configured';
+      db.prepare("UPDATE email_notifications SET status='failed',last_error_code=? WHERE id=?").run(code, notificationId);
+      app.log.error({ event: 'email_delivery_failed', kind: 'chat', notificationId, code });
+      return 'failed';
+    }
   };
   const auth = (request: FastifyRequest, reply: FastifyReply, role?: 'customer' | 'admin') => {
     const actor = actorFromRequest(db, request);
@@ -95,7 +124,7 @@ export function buildApp({ db, origin, secureCookies = false, sendMail, teamEmai
     if (typeof error === 'object' && error && 'statusCode' in error && typeof error.statusCode === 'number' && error.statusCode >= 400 && error.statusCode < 500) {
       return fail(reply, error.statusCode, error.statusCode === 413 ? 'Запит завеликий.' : 'Невірний формат запиту.');
     }
-    app.log.error(error);
+    app.log.error({ event: 'api_error' });
     return fail(reply, 500, 'Помилка сервера.');
   });
   app.get('/api/v1/health', async () => ({ ok: db.pragma('quick_check', { simple: true }) === 'ok' }));
@@ -161,7 +190,7 @@ export function buildApp({ db, origin, secureCookies = false, sendMail, teamEmai
     if (user && sendMail) {
       const token = newAuthToken(db, user.id, 'reset', 30 * 60 * 1000);
       await mail(user.email, 'Відновлення пароля SELTIVO', `${origin}/reset-password?token=${token}`);
-    }
+    } else if (user) app.log.error({ event: 'email_delivery_failed', kind: 'auth', code: 'mail_not_configured' });
     return reply.code(202).send({ ok: true });
   });
   app.post('/api/v1/auth/reset-password', async (request, reply) => {
@@ -308,14 +337,18 @@ export function buildApp({ db, origin, secureCookies = false, sendMail, teamEmai
     }
     if (row.status === 'completed' || row.status === 'cancelled') return fail(reply, 409, 'Діалог завершено.');
     const timestamp = now();
-    const result = db.prepare('INSERT INTO messages(conversation_id,sender_id,client_message_id,body,created_at) VALUES (?,?,?,?,?)').run(row.conversation_id, actor.id, body.clientMessageId, body.body, timestamp);
-    if (actor.role === 'admin') {
-      const customer = db.prepare('SELECT email FROM users WHERE id=?').get(row.customer_id) as { email: string };
-      await mail(customer.email, 'Нова відповідь SELTIVO', `Нова відповідь у заявці ${row.id}: ${origin}/account/requests/${row.id}`);
-    } else if (teamEmail) {
-      await mail(teamEmail, 'Нове повідомлення клієнта SELTIVO', `Нове повідомлення у заявці ${row.id}: ${origin}/admin/requests/${row.id}`);
-    }
-    return reply.code(201).send({ id: Number(result.lastInsertRowid), senderId: actor.id, body: body.body, createdAt: timestamp });
+    const recipient = actor.role === 'admin'
+      ? (db.prepare('SELECT email FROM users WHERE id=?').get(row.customer_id) as { email: string }).email
+      : teamEmail;
+    const notificationId = recipient ? randomUUID() : null;
+    const messageId = db.transaction(() => {
+      const result = db.prepare('INSERT INTO messages(conversation_id,sender_id,client_message_id,body,created_at) VALUES (?,?,?,?,?)').run(row.conversation_id, actor.id, body.clientMessageId, body.body, timestamp);
+      if (recipient && notificationId) db.prepare(`INSERT INTO email_notifications(id,message_id,recipient,status,created_at)
+        VALUES (?,?,?,'pending',?)`).run(notificationId, Number(result.lastInsertRowid), recipient, timestamp);
+      return Number(result.lastInsertRowid);
+    })();
+    if (notificationId) await deliverNotification(notificationId);
+    return reply.code(201).send({ id: messageId, senderId: actor.id, body: body.body, createdAt: timestamp });
   });
   app.patch('/api/v1/requests/:id/read', async (request, reply) => {
     const actor = auth(request, reply); if (!actor) return;
@@ -390,6 +423,33 @@ export function buildApp({ db, origin, secureCookies = false, sendMail, teamEmai
   app.get('/api/v1/admin/audit', async (request, reply) => {
     if (!auth(request, reply, 'admin')) return;
     return { items: db.prepare('SELECT id,actor_id actorId,action,entity_type entityType,entity_id entityId,created_at createdAt FROM audit_log ORDER BY created_at DESC LIMIT 100').all() };
+  });
+  app.get('/api/v1/admin/diagnostics', async (request, reply) => {
+    if (!auth(request, reply, 'admin')) return;
+    const integrity = db.pragma('quick_check', { simple: true });
+    const foreignKeys = (db.pragma('foreign_key_check') as unknown[]).length;
+    return { ok: integrity === 'ok' && foreignKeys === 0, integrity, foreignKeyViolations: foreignKeys,
+      databaseBytes: databaseBytes?.() ?? null, emailConfigured: Boolean(sendMail) };
+  });
+  app.get('/api/v1/admin/email-notifications', async (request, reply) => {
+    if (!auth(request, reply, 'admin')) return;
+    const query = parse(page, request.query, reply); if (!query) return;
+    const items = db.prepare(`SELECT n.id,n.message_id messageId,r.id requestId,n.recipient,n.status,n.attempts,
+      n.last_attempt_at lastAttemptAt,n.last_error_code lastErrorCode,n.created_at createdAt
+      FROM email_notifications n JOIN messages m ON m.id=n.message_id
+      JOIN conversations c ON c.id=m.conversation_id JOIN requests r ON r.id=c.request_id
+      WHERE n.status<>'sent' ORDER BY n.created_at DESC,n.id DESC LIMIT ? OFFSET ?`).all(query.limit, query.offset);
+    return { items, nextOffset: (items as unknown[]).length === query.limit ? query.offset + query.limit : null };
+  });
+  app.post('/api/v1/admin/email-notifications/:id/retry', async (request, reply) => {
+    const actor = auth(request, reply, 'admin'); if (!actor) return;
+    const notificationId = (request.params as { id: string }).id;
+    if (!id.safeParse(notificationId).success) return fail(reply, 422, 'Невірний ідентифікатор.');
+    const outcome = await deliverNotification(notificationId);
+    if (outcome === 'missing') return fail(reply, 404, 'Не знайдено.');
+    if (outcome === 'busy') return fail(reply, 409, 'Відправлення вже обробляється або виконане.');
+    audit(db, actor.id, 'email.retry', 'email_notification', notificationId);
+    return { id: notificationId, status: outcome };
   });
   return app;
 }

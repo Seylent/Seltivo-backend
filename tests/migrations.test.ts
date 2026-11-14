@@ -5,7 +5,7 @@ import { basename, join, resolve, sep } from 'node:path';
 import { test } from 'node:test';
 import Database from 'better-sqlite3';
 import { openDatabase } from '../src/db.js';
-import { SCHEMA_SQL } from '../src/schema.js';
+import { MIGRATIONS, SCHEMA_SQL } from '../src/schema.js';
 
 function removeTestDirectory(directory: string) {
   const target = resolve(directory);
@@ -14,6 +14,7 @@ function removeTestDirectory(directory: string) {
 }
 
 test('an existing unversioned database is upgraded without losing records and reopening is a no-op', () => {
+  const latest = MIGRATIONS.at(-1)!.version;
   const directory = mkdtempSync(join(tmpdir(), 'seltivo-migration-'));
   const filename = join(directory, 'legacy.db');
   try {
@@ -32,7 +33,8 @@ test('an existing unversioned database is upgraded without losing records and re
     let rows: unknown[][];
     let schemaVersion: unknown;
     try {
-      assert.equal(upgraded.pragma('user_version', { simple: true }), 1);
+      assert.equal(upgraded.pragma('user_version', { simple: true }), latest);
+      assert.equal((upgraded.prepare("SELECT COUNT(*) AS count FROM email_notifications").get() as { count: number }).count, 0);
       assert.equal((upgraded.pragma('foreign_key_check') as unknown[]).length, 0);
       assert.equal(upgraded.pragma('integrity_check', { simple: true }), 'ok');
       rows = ['users', 'configurations', 'requests', 'conversations', 'messages'].map(
@@ -42,7 +44,7 @@ test('an existing unversioned database is upgraded without losing records and re
     } finally { upgraded.close(); }
 
     const reopened = openDatabase(filename);
-    assert.equal(reopened.pragma('user_version', { simple: true }), 1);
+    assert.equal(reopened.pragma('user_version', { simple: true }), latest);
     assert.equal(reopened.pragma('schema_version', { simple: true }), schemaVersion);
     assert.deepEqual(['users', 'configurations', 'requests', 'conversations', 'messages'].map(
       (table) => reopened.prepare(`SELECT * FROM ${table}`).all(),
@@ -82,4 +84,21 @@ test('unknown future and incompatible legacy schemas are rejected without changi
   } finally {
     removeTestDirectory(directory);
   }
+});
+
+test('version 1 advances to version 2 without changing existing records', () => {
+  const directory = mkdtempSync(join(tmpdir(), 'seltivo-migration-'));
+  const filename = join(directory, 'v1.db');
+  try {
+    const old = new Database(filename);
+    old.exec(SCHEMA_SQL);
+    old.pragma('user_version = 1');
+    old.prepare("INSERT INTO users(id,email,password_hash,role,name,created_at,updated_at) VALUES ('u1','v1@example.test','hash','customer','Previous','2026-01-01','2026-01-01')").run();
+    old.close();
+    const migrated = openDatabase(filename);
+    assert.equal(migrated.pragma('user_version', { simple: true }), 2);
+    assert.equal((migrated.prepare("SELECT name FROM users WHERE id='u1'").get() as { name: string }).name, 'Previous');
+    assert.equal((migrated.prepare('SELECT COUNT(*) AS count FROM email_notifications').get() as { count: number }).count, 0);
+    migrated.close();
+  } finally { removeTestDirectory(directory); }
 });

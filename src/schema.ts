@@ -71,4 +71,20 @@ export const SCHEMA_SQL = `
 
 // Append each subsequent schema change as a new { version, sql } entry.
 // Version 1 is the schema that existed before PRAGMA user_version was introduced.
-export const MIGRATIONS = [{ version: 1, sql: SCHEMA_SQL }] as const;
+export const MIGRATIONS = [
+  { version: 1, sql: SCHEMA_SQL },
+  { version: 2, sql: `
+    CREATE TABLE email_notifications (
+      id TEXT PRIMARY KEY,
+      message_id INTEGER NOT NULL UNIQUE REFERENCES messages(id) ON DELETE CASCADE,
+      recipient TEXT NOT NULL,
+      status TEXT NOT NULL CHECK(status IN ('pending','sending','sent','failed')),
+      attempts INTEGER NOT NULL DEFAULT 0,
+      last_attempt_at TEXT,
+      sent_at TEXT,
+      last_error_code TEXT,
+      created_at TEXT NOT NULL
+    );
+    CREATE INDEX email_notifications_status ON email_notifications(status, created_at DESC);
+  ` },
+] as const;

@@ -41,6 +41,10 @@ test('registration, ownership, idempotent requests, chat and admin status', asyn
     const updated = await call('PATCH', `/api/v1/configurations/${config.body.id}`, { name: 'Оновлений сайт', data: { id: 'brand', name: 'Updated', colors: {}, hero: {}, home: {}, products: [] } }, alice, { 'if-match': '1' });
     assert.equal(updated.body.revision, 2);
     assert.equal((await call('GET', `/api/v1/requests/${first.body.id}`, undefined, alice)).body.configuration.name, 'Brand');
+    assert.equal((await call('DELETE', `/api/v1/configurations/${config.body.id}`, undefined, bob)).status, 404);
+    assert.equal((await call('DELETE', `/api/v1/configurations/${config.body.id}`, undefined, alice)).status, 204);
+    assert.equal((await call('GET', `/api/v1/configurations/${config.body.id}`, undefined, alice)).status, 404);
+    assert.equal((await call('GET', `/api/v1/requests/${first.body.id}`, undefined, alice)).body.configuration.name, 'Brand');
     assert.equal((await call('GET', `/api/v1/requests/${first.body.id}`, undefined, bob)).status, 404);
     assert.equal((await call('POST', `/api/v1/requests/${first.body.id}/messages`, { body: 'Hi', clientMessageId: randomUUID() }, bob)).status, 404);
     const messageKey = randomUUID();
@@ -54,6 +58,8 @@ test('registration, ownership, idempotent requests, chat and admin status', asyn
     db.prepare("INSERT INTO users(id,email,password_hash,role,name,email_verified_at,created_at,updated_at) VALUES (?,?,?,'admin','Admin',?,?,?)")
       .run(adminId, 'admin@example.test', await hashPassword('VeryStrongPass123!'), timestamp, timestamp, timestamp);
     const admin = (await call('POST', '/api/v1/auth/login', { email: 'admin@example.test', password: 'VeryStrongPass123!' })).cookie!.split(';')[0];
+    assert.equal((await call('GET', '/api/v1/admin/diagnostics', undefined, customer)).status, 403);
+    assert.equal((await call('GET', '/api/v1/admin/diagnostics', undefined, admin)).body.ok, true);
     const customersPage = await call('GET', '/api/v1/admin/customers?limit=1', undefined, admin);
     assert.equal(customersPage.body.items.length, 1);
     assert.equal(customersPage.body.nextOffset, 1);
@@ -80,4 +86,42 @@ test('registration, ownership, idempotent requests, chat and admin status', asyn
   } finally {
     await app.close(); db.close();
   }
+});
+
+test('failed chat email is visible to admins and retry does not create another message', async () => {
+  const db = openDatabase(':memory:');
+  let sends = 0;
+  const app = buildApp({ db, origin, teamEmail: 'team@example.test', logger: false,
+    sendMail: async () => { if (++sends === 1) throw new Error('private provider detail'); } });
+  const call = async (method: string, url: string, payload?: unknown, cookie?: string) => {
+    const response = await app.inject({ method: method as 'GET', url, headers: { origin, ...(cookie ? { cookie } : {}) }, payload } as any);
+    return { status: response.statusCode, body: response.body ? JSON.parse(response.body) : null, cookie: response.headers['set-cookie'] as string | undefined };
+  };
+  try {
+    await call('POST', '/api/v1/auth/register', { email: 'customer@example.test', password: 'VeryStrongPass123!', name: 'Customer' });
+    const customer = (await call('POST', '/api/v1/auth/login', { email: 'customer@example.test', password: 'VeryStrongPass123!' })).cookie!.split(';')[0];
+    const timestamp = now();
+    db.prepare("INSERT INTO users(id,email,password_hash,role,name,email_verified_at,created_at,updated_at) VALUES (?,?,?,'admin','Admin',?,?,?)")
+      .run(randomUUID(), 'admin@example.test', await hashPassword('VeryStrongPass123!'), timestamp, timestamp, timestamp);
+    const admin = (await call('POST', '/api/v1/auth/login', { email: 'admin@example.test', password: 'VeryStrongPass123!' })).cookie!.split(';')[0];
+    const submitted = await call('POST', '/api/v1/requests', { templateId: 'fashion-01', templateName: 'Fashion 01', contact: { name: 'Customer' }, clientSubmissionId: randomUUID() }, customer);
+    assert.equal(submitted.status, 201);
+    const url = `/api/v1/requests/${submitted.body.id}/messages`;
+    const payload = { body: 'Please help', clientMessageId: randomUUID() };
+    assert.equal((await call('POST', url, payload, customer)).status, 201);
+    assert.equal((await call('POST', url, payload, customer)).status, 200);
+    assert.equal(sends, 1);
+    assert.equal((await call('GET', '/api/v1/admin/email-notifications', undefined, customer)).status, 403);
+    const failed = await call('GET', '/api/v1/admin/email-notifications', undefined, admin);
+    assert.equal(failed.body.items.length, 1);
+    assert.equal(failed.body.items[0].status, 'failed');
+    assert.equal(failed.body.items[0].lastErrorCode, 'provider_error');
+    const retryUrl = `/api/v1/admin/email-notifications/${failed.body.items[0].id}/retry`;
+    assert.equal((await call('POST', retryUrl, {}, customer)).status, 403);
+    assert.equal((await call('POST', retryUrl, {}, admin)).body.status, 'sent');
+    assert.equal((await call('POST', retryUrl, {}, admin)).status, 409);
+    assert.equal(sends, 2);
+    assert.equal((await call('GET', '/api/v1/admin/email-notifications', undefined, admin)).body.items.length, 0);
+    assert.equal((await call('GET', url, undefined, customer)).body.items.length, 1);
+  } finally { await app.close(); db.close(); }
 });

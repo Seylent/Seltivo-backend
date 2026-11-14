@@ -4,7 +4,7 @@
 
 ## Запуск
 
-Потрібен Node.js 24+ і локальний диск для SQLite. Нові клієнтські акаунти зараз створюються без підтвердження email; пошта потрібна для відновлення пароля.
+Для локального Node-сервера потрібен Node.js 24+ і локальний диск для SQLite. Production планується на Cloudflare Worker із SQLite-backed Durable Object. Нові клієнтські акаунти зараз створюються без підтвердження email; пошта потрібна для відновлення пароля.
 
 ```powershell
 npm install
@@ -12,13 +12,13 @@ $env:SELTIVO_PUBLIC_ORIGIN = 'http://localhost:3000'
 npm run dev
 ```
 
-Для production: `npm ci`, `npm run build`, `npm start`. Команди `admin:bootstrap` і `backup` також запускаються після `npm run build`.
+Для локального Node-сервера: `npm ci`, `npm run build`, `npm start`. Команди `admin:bootstrap` і `backup` працюють лише з Node/SQLite. Для Worker: `npm run dev:cloudflare` локально; порядок production-релізу й відкриті умови готовності описані в [Cloudflare operations](docs/cloudflare-operations.md).
 
 Сервер слухає `127.0.0.1:4000`. У production проксі має направляти `/api/v1/*` на бекенд під тим самим origin, що й Next. Бекенд не виставляйте напряму в інтернет. Для довіреного локального проксі можна встановити `SELTIVO_TRUST_PROXY=1`, щоб ліміти враховували IP клієнта із forwarded headers. На проксі також потрібні TLS, обмеження тіла запиту й rate limit.
 
-База за замовчуванням: `./data/seltivo.db`; у production задайте `SELTIVO_DB_PATH` на постійному **локальному** томі. Схема v1 застосовується атомарною SQL-міграцією при першому відкритті БД; стара заповнена БД без `user_version` оновлюється зі збереженням даних. `foreign_keys` і WAL увімкнені. Перед розгортанням нової версії зробіть копію: `npm run backup -- D:\backups\seltivo-20261114T010000Z.db`. Перевірка відновленого файлу: `npm run backup:verify -- D:\staging\restored.db`. Графік, ротація й кроки відновлення описані в [процедурі резервування](docs/backup-recovery.md).
+Node база за замовчуванням: `./data/seltivo.db`; для Node-інсталяції задайте `SELTIVO_DB_PATH` на постійному **локальному** томі. Схема v2 застосовується послідовними SQL-міграціями; стара заповнена БД без `user_version` оновлюється зі збереженням даних. `foreign_keys` і WAL увімкнені. Node-копія: `npm run backup -- D:\backups\seltivo-20261114T010000Z.db`; перевірка файлу: `npm run backup:verify -- D:\staging\restored.db`. [Процедура Node-резервування](docs/backup-recovery.md) не застосовується до Worker. Worker веде версії в `schema_migrations`; його відновлення описане окремо в [Cloudflare operations](docs/cloudflare-operations.md).
 
-Для пошти заповніть `SMTP_HOST`, `SMTP_PORT`, `SMTP_USER`, `SMTP_PASSWORD`, `SMTP_FROM`. Реєстрація зараз працює без SMTP, але відновлення пароля без пошти неможливе. `SELTIVO_TEAM_EMAIL` отримує сповіщення про повідомлення клієнтів. Збій пошти не скасовує вже збережене повідомлення; його видно в API, збій записується в журнал сервера.
+Для Node-пошти заповніть `SMTP_HOST`, `SMTP_PORT`, `SMTP_USER`, `SMTP_PASSWORD`, `SMTP_FROM`. Реєстрація зараз працює без SMTP, але відновлення пароля без пошти неможливе. `SELTIVO_TEAM_EMAIL` отримує сповіщення про повідомлення клієнтів. Збій пошти не скасовує вже збережене повідомлення; адміністратор бачить недоставлені листи в API та адмінці й може повторити доставку.
 
 Для Cloudflare Worker використовуйте Brevo API замість SMTP. У Brevo підтвердьте домен і адресу відправника, активуйте транзакційні листи, створіть API key. Збережіть ключ як секрет Worker командою `npx wrangler secret put BREVO_API_KEY`, а перевірену адресу відправника — `npx wrangler secret put BREVO_SENDER_EMAIL`. Після розгортання перевірте реальну доставку листа відновлення пароля. Не додавайте ключ у `wrangler.jsonc` чи Git. Поки підтвердження email вимкнене, користувач може зареєструвати адресу, якою не володіє; перед увімкненням пошти перегляньте акаунти, створені в цей період.
 
@@ -46,13 +46,13 @@ Remove-Item Env:SELTIVO_ADMIN_PASSWORD
 | Збережені конфігурації | `GET/POST /configurations`, `GET/PATCH/DELETE /configurations/:id` |
 | Заявки | `GET/POST /requests`, `GET /requests/:id` |
 | Чат | `GET/POST /requests/:id/messages`, `PATCH /requests/:id/read`, `GET /notifications/unread-count` |
-| Адміністратор | `GET /admin/customers`, `GET /admin/requests`, `PATCH /admin/requests/:id/status`, `GET /admin/audit` |
+| Адміністратор | `GET /admin/customers`, `GET /admin/requests`, `PATCH /admin/requests/:id/status`, `GET /admin/email-notifications`, `POST /admin/email-notifications/:id/retry`, `GET /admin/diagnostics`, `GET /admin/audit` |
 
 Створення заявки вимагає `clientSubmissionId` (UUID); повідомлення — `clientMessageId` (UUID). Повторіть той самий ID і ті самі дані після timeout: сервер поверне попередній результат. Для оновлення конфігурації та статусу потрібен `If-Match` із поточною версією. Чужі заявки й конфігурації повертають 404.
 
 Конфігурація зберігається як JSON до 8 МБ; до 30 зображень PNG/JPEG/WebP можуть бути вкладені як data URL. Створена заявка отримує окремий знімок конфігурації, тому подальше редагування або приховування збереженого варіанта не змінює історію заявки. Діалог оновлюється запитами з інтервалом, WebSocket і вкладень у v1 немає. Повідомлення про відповідь адміністратора надсилається email; помилка доставки не видаляє повідомлення з діалогу.
 
-`DELETE /configurations/:id` приховує збережений варіант, але не стирає знімок у вже створених заявках. Автоматичного видалення акаунта й історії v1 поки немає: перед production потрібні затверджені строки зберігання, процедура запиту на видалення та строк життя резервних копій.
+`DELETE /configurations/:id` приховує збережений варіант, але не стирає знімок у вже створених заявках. Для повного видалення акаунта погоджено прибирати також заявки й чат з активної БД; реалізація чекає захищеного журналу видалень поза Durable Object, щоб старе відновлення не повернуло дані. Строк даних у вже створених копіях — до 30 днів.
 
 ## Перевірки
 

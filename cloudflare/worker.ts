@@ -35,9 +35,8 @@ export class SeltivoData extends DurableObject<Env> {
 
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
-    if (!env.SELTIVO_PUBLIC_ORIGIN?.startsWith('https://')) {
-      throw new Error('SELTIVO_PUBLIC_ORIGIN must be HTTPS');
-    }
+    const localOrigin = /^http:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/.test(env.SELTIVO_PUBLIC_ORIGIN ?? '');
+    if (!env.SELTIVO_PUBLIC_ORIGIN?.startsWith('https://') && !localOrigin) throw new Error('SELTIVO_PUBLIC_ORIGIN must be HTTPS outside local development');
     const db = openCloudflareDatabase(ctx.storage);
     if (env.SELTIVO_ADMIN_PASSWORD_HASH) {
       const timestamp = new Date().toISOString();
@@ -48,14 +47,18 @@ export class SeltivoData extends DurableObject<Env> {
     this.app = buildApp({
       db,
       origin: env.SELTIVO_PUBLIC_ORIGIN,
-      secureCookies: true,
+      secureCookies: !localOrigin,
       logger: false,
       router: createWorkerRouter(),
       sendMail: brevoMail(env),
+      teamEmail: env.SELTIVO_ADMIN_EMAIL,
+      databaseBytes: () => ctx.storage.sql.databaseSize,
     });
   }
 
   async fetch(request: Request): Promise<Response> {
+    const started = Date.now();
+    const requestId = randomUUID();
     const url = new URL(request.url);
     const body = request.method === 'GET' || request.method === 'HEAD'
       ? undefined : Buffer.from(await request.arrayBuffer());
@@ -69,6 +72,9 @@ export class SeltivoData extends DurableObject<Env> {
     for (const [key, value] of Object.entries(result.headers)) {
       if (value !== undefined) headers.set(key, String(value));
     }
+    headers.set('X-Request-Id', requestId);
+    console.log(JSON.stringify({ event: 'api_request', requestId, method: request.method,
+      status: result.statusCode, durationMs: Date.now() - started, databaseBytes: this.ctx.storage.sql.databaseSize }));
     return new Response(result.rawPayload, { status: result.statusCode, headers });
   }
 }
