@@ -18,6 +18,7 @@ function brevoMail(env: Env) {
   return async (to: string, subject: string, text: string) => {
     const response = await fetch('https://api.brevo.com/v3/smtp/email', {
       method: 'POST',
+      signal: AbortSignal.timeout(15_000),
       headers: { 'api-key': env.BREVO_API_KEY!, 'content-type': 'application/json', accept: 'application/json' },
       body: JSON.stringify({
         sender: { email: env.BREVO_SENDER_EMAIL, name: 'Seltivo' },

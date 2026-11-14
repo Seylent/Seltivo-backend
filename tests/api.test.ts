@@ -58,7 +58,7 @@ test('registration, ownership, idempotent requests, chat and admin status', asyn
     db.prepare("INSERT INTO users(id,email,password_hash,role,name,email_verified_at,created_at,updated_at) VALUES (?,?,?,'admin','Admin',?,?,?)")
       .run(adminId, 'admin@example.test', await hashPassword('VeryStrongPass123!'), timestamp, timestamp, timestamp);
     const admin = (await call('POST', '/api/v1/auth/login', { email: 'admin@example.test', password: 'VeryStrongPass123!' })).cookie!.split(';')[0];
-    assert.equal((await call('GET', '/api/v1/admin/diagnostics', undefined, customer)).status, 403);
+    assert.equal((await call('GET', '/api/v1/admin/diagnostics', undefined, alice)).status, 403);
     assert.equal((await call('GET', '/api/v1/admin/diagnostics', undefined, admin)).body.ok, true);
     const customersPage = await call('GET', '/api/v1/admin/customers?limit=1', undefined, admin);
     assert.equal(customersPage.body.items.length, 1);
