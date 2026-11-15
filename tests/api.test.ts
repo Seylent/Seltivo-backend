@@ -57,7 +57,10 @@ test('registration, ownership, idempotent requests, chat and admin status', asyn
     const adminId = randomUUID(), timestamp = now();
     db.prepare("INSERT INTO users(id,email,password_hash,role,name,email_verified_at,created_at,updated_at) VALUES (?,?,?,'admin','Admin',?,?,?)")
       .run(adminId, 'admin@example.test', await hashPassword('VeryStrongPass123!'), timestamp, timestamp, timestamp);
+    db.prepare("INSERT INTO users(id,email,password_hash,role,name,email_verified_at,created_at,updated_at) VALUES (?,?,?,'admin','Admin 2',?,?,?)")
+      .run(randomUUID(), 'admin2@example.test', await hashPassword('VeryStrongPass123!'), timestamp, timestamp, timestamp);
     const admin = (await call('POST', '/api/v1/auth/login', { email: 'admin@example.test', password: 'VeryStrongPass123!' })).cookie!.split(';')[0];
+    const admin2 = (await call('POST', '/api/v1/auth/login', { email: 'admin2@example.test', password: 'VeryStrongPass123!' })).cookie!.split(';')[0];
     assert.equal((await call('GET', '/api/v1/admin/diagnostics', undefined, alice)).status, 403);
     assert.equal((await call('GET', '/api/v1/admin/diagnostics', undefined, admin)).body.ok, true);
     const customersPage = await call('GET', '/api/v1/admin/customers?limit=1', undefined, admin);
@@ -71,8 +74,9 @@ test('registration, ownership, idempotent requests, chat and admin status', asyn
     assert.equal((await call('GET', `/api/v1/requests/${first.body.id}/messages`, undefined, alice)).body.items[0].readByRecipient, true);
     const status = await call('PATCH', `/api/v1/admin/requests/${first.body.id}/status`, { status: 'reviewing', reason: 'Розпочали' }, admin, { 'if-match': '1' });
     assert.equal(status.status, 200);
-    assert.equal((await call('PATCH', `/api/v1/admin/requests/${first.body.id}/status`, { status: 'completed' }, admin, { 'if-match': '1' })).status, 409);
-    assert.equal((await call('GET', `/api/v1/requests/${first.body.id}`, undefined, alice)).body.events.length, 2);
+    assert.equal((await call('PATCH', `/api/v1/admin/requests/${first.body.id}/status`, { status: 'in_progress' }, admin2, { 'if-match': '1' })).status, 409);
+    assert.equal((await call('PATCH', `/api/v1/admin/requests/${first.body.id}/status`, { status: 'in_progress' }, admin2, { 'if-match': '2' })).status, 200);
+    assert.equal((await call('GET', `/api/v1/requests/${first.body.id}`, undefined, alice)).body.events.length, 3);
     assert.equal((await call('GET', '/api/v1/admin/customers', undefined, alice)).status, 403);
     const invalid = await app.inject({ method: 'POST', url: '/api/v1/auth/login', headers: { origin, 'content-type': 'application/json' }, payload: '{' });
     assert.equal(invalid.statusCode, 400);
