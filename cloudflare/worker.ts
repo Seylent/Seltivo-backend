@@ -4,11 +4,14 @@ import { buildApp } from '../src/app.js';
 import { openCloudflareDatabase } from '../src/cloudflare-db.js';
 import { createWorkerRouter } from './worker-router.js';
 import { purgeCustomer } from '../src/delete-account.js';
+import { createLogicalBackup } from '../src/logical-backup.js';
+import type { SeltivoDb } from '../src/db.js';
 export { DeletionLedger } from './deletion-ledger.js';
 
 interface Env {
   SELTIVO: DurableObjectNamespace;
   SELTIVO_DELETIONS: DurableObjectNamespace;
+  SELTIVO_BACKUP_BUCKET: R2Bucket;
   SELTIVO_PUBLIC_ORIGIN: string;
   SELTIVO_ADMIN_EMAIL: string;
   SELTIVO_ADMIN_PASSWORD_HASH?: string;
@@ -37,12 +40,16 @@ function brevoMail(env: Env) {
 
 export class SeltivoData extends DurableObject<Env> {
   private app: ReturnType<typeof buildApp>;
+  private db: SeltivoDb;
+  private backupBucket: R2Bucket;
 
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
     const localOrigin = /^http:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/.test(env.SELTIVO_PUBLIC_ORIGIN ?? '');
     if (!env.SELTIVO_PUBLIC_ORIGIN?.startsWith('https://') && !localOrigin) throw new Error('SELTIVO_PUBLIC_ORIGIN must be HTTPS outside local development');
     const db = openCloudflareDatabase(ctx.storage);
+    this.db = db;
+    this.backupBucket = env.SELTIVO_BACKUP_BUCKET;
     const ledger = env.SELTIVO_DELETIONS.get(env.SELTIVO_DELETIONS.idFromName('primary'));
     ctx.blockConcurrencyWhile(async () => {
       const response = await ledger.fetch('https://ledger.internal/deletions');
@@ -84,6 +91,18 @@ export class SeltivoData extends DurableObject<Env> {
     const started = Date.now();
     const requestId = randomUUID();
     const url = new URL(request.url);
+    if (url.pathname === '/internal/backup' && request.method === 'POST') {
+      try {
+        const result = await createLogicalBackup(this.db, this.backupBucket);
+        console.log(JSON.stringify({ event: 'backup_completed', requestId, durationMs: Date.now() - started,
+          bytes: result.bytes, databaseBytes: this.ctx.storage.sql.databaseSize }));
+        return Response.json({ key: result.key, bytes: result.bytes });
+      } catch (error) {
+        console.error(JSON.stringify({ event: 'backup_failed', requestId, durationMs: Date.now() - started,
+          errorType: error instanceof Error ? error.name : 'unknown' }));
+        return Response.json({ error: 'Backup failed' }, { status: 500 });
+      }
+    }
     const body = request.method === 'GET' || request.method === 'HEAD'
       ? undefined : Buffer.from(await request.arrayBuffer());
     const result = await this.app.inject({
@@ -105,7 +124,13 @@ export class SeltivoData extends DurableObject<Env> {
 
 export default {
   fetch(request: Request, env: Env) {
+    if (new URL(request.url).pathname.startsWith('/internal/')) return new Response(null, { status: 404 });
     const id = env.SELTIVO.idFromName('primary');
     return env.SELTIVO.get(id).fetch(request);
+  },
+  async scheduled(_controller: ScheduledController, env: Env) {
+    const id = env.SELTIVO.idFromName('primary');
+    const response = await env.SELTIVO.get(id).fetch(new Request('https://internal.seltivo/internal/backup', { method: 'POST' }));
+    if (!response.ok) throw new Error('Daily backup failed');
   },
 };
