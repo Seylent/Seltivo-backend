@@ -54,7 +54,7 @@ Remove-Item Env:SELTIVO_ADMIN_PASSWORD
 
 `DELETE /configurations/:id` приховує збережений варіант, але не стирає знімок у вже створених заявках. `DELETE /me` видаляє клієнтський акаунт разом із заявками й чатом після перевірки пароля. У Worker окремий Durable Object зберігає журнал ID видалень і повторно застосовує їх після PITR. Функція вимкнена за замовчуванням до пробного restore на staging; порядок увімкнення — у [Cloudflare operations](docs/cloudflare-operations.md). Строк даних у вже створених копіях — до 30 днів.
 
-Worker підготовлено до щоденної логічної копії в R2 о 02:00 UTC. Поки приватний bucket, 30-денне правило зберігання й staging restore не перевірені в Cloudflare, production-критерій резервування не виконано. Команди налаштування та перевірки — у [Cloudflare operations](docs/cloudflare-operations.md).
+Worker підготовлено до щоденної логічної копії в R2 о 02:00 UTC. Приватний bucket і 30-денне правило зберігання налаштовані; staging restore ще не перевірено, тому production-критерій резервування не виконано. Команди перевірки — у [Cloudflare operations](docs/cloudflare-operations.md).
 
 ## Перевірки
 
