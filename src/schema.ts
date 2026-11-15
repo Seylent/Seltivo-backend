@@ -87,4 +87,17 @@ export const MIGRATIONS = [
     );
     CREATE INDEX email_notifications_status ON email_notifications(status, created_at DESC);
   ` },
+  { version: 3, sql: `
+    CREATE TABLE notifications (
+      id TEXT PRIMARY KEY,
+      recipient_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      request_id TEXT NOT NULL REFERENCES requests(id) ON DELETE CASCADE,
+      kind TEXT NOT NULL CHECK(kind IN ('status','message')),
+      status TEXT,
+      created_at TEXT NOT NULL,
+      read_at TEXT
+    );
+    CREATE INDEX notifications_recipient ON notifications(recipient_id, created_at DESC);
+    CREATE INDEX notifications_request ON notifications(request_id, recipient_id, read_at);
+  ` },
 ] as const;

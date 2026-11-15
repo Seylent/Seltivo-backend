@@ -6,11 +6,12 @@ import { openDatabase } from '../src/db.js';
 import { openCloudflareDatabase } from '../src/cloudflare-db.js';
 import { createLogicalBackup, restoreLogicalBackup } from '../src/logical-backup.js';
 import { now, hashPassword } from '../src/auth.js';
+import { MIGRATIONS } from '../src/schema.js';
 
 function database() {
   const db = openDatabase(':memory:');
   db.exec('CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL)');
-  db.prepare('INSERT INTO schema_migrations(version,applied_at) VALUES (?,?)').run(2, now());
+  db.prepare('INSERT INTO schema_migrations(version,applied_at) VALUES (?,?)').run(MIGRATIONS.at(-1)!.version, now());
   return db;
 }
 
@@ -60,6 +61,8 @@ test('logical backup restores data and replays confirmed deletion', async () => 
       .run(requestId, userId, 'fashion-01', 'Fashion', configId, '{"brand":"Alice"}', '{"name":"Alice"}', '', '[]', randomUUID(), date, date);
     const conversationId = randomUUID();
     source.prepare('INSERT INTO conversations(id,request_id,created_at) VALUES (?,?,?)').run(conversationId, requestId, date);
+    source.prepare("INSERT INTO notifications(id,recipient_id,request_id,kind,status,created_at) VALUES (?,?,?,'status','reviewing',?)")
+      .run(randomUUID(), userId, requestId, date);
     source.prepare('INSERT INTO messages(conversation_id,sender_id,client_message_id,body,created_at) VALUES (?,?,?,?,?)')
       .run(conversationId, userId, randomUUID(), 'Hello', date);
     const store = memoryStore();
@@ -67,10 +70,12 @@ test('logical backup restores data and replays confirmed deletion', async () => 
     assert.equal(backup.manifest.rowCounts.users, 1);
     assert.equal(backup.manifest.rowCounts.requests, 1);
     assert.equal(backup.manifest.rowCounts.messages, 1);
+    assert.equal(backup.manifest.rowCounts.notifications, 1);
     assert.ok(backup.bytes > 0);
     await restoreLogicalBackup(target, store, backup.key);
     assert.equal((target.prepare('SELECT COUNT(*) AS count FROM users').get() as { count: number }).count, 1);
     assert.equal((target.prepare('SELECT body FROM messages').get() as { body: string }).body, 'Hello');
+    assert.equal((target.prepare('SELECT COUNT(*) AS count FROM notifications').get() as { count: number }).count, 1);
     assert.equal((target.pragma('foreign_key_check') as unknown[]).length, 0);
     await restoreLogicalBackup(deletedTarget, store, backup.key, [userId]);
     assert.equal((deletedTarget.prepare('SELECT COUNT(*) AS count FROM users').get() as { count: number }).count, 0);

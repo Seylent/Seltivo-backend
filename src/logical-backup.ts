@@ -6,7 +6,7 @@ import { purgeCustomer } from './delete-account.js';
 const tables = [
   'users', 'sessions', 'auth_tokens', 'configurations', 'requests',
   'conversations', 'messages', 'conversation_reads', 'request_events',
-  'audit_log', 'email_notifications',
+  'audit_log', 'email_notifications', 'notifications',
 ] as const;
 type Table = typeof tables[number];
 type Row = Record<string, string | number | null>;

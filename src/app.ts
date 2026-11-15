@@ -57,6 +57,15 @@ function configJson(value: unknown): string | null {
 export function buildApp({ db, origin, secureCookies = false, sendMail, teamEmail, databaseBytes, deleteCustomer, logger = process.env.NODE_ENV !== 'test', router }: AppOptions) {
   const app = router ?? Fastify({ logger, bodyLimit: 9 * 1024 * 1024, trustProxy: process.env.SELTIVO_TRUST_PROXY === '1' });
   const attempts = new Map<string, number[]>();
+  const rateLimitFor = (path: string) => {
+    if (path.endsWith('/auth/register') || path.endsWith('/auth/forgot-password') || path.endsWith('/auth/resend-verification')) {
+      return { windowMs: 15 * 60_000, max: 5 };
+    }
+    if (path === '/api/v1/requests') return { windowMs: 10 * 60_000, max: 5 };
+    if (path === '/api/v1/configurations') return { windowMs: 10 * 60_000, max: 20 };
+    if (path.includes('/messages')) return { windowMs: 60_000, max: 30 };
+    return { windowMs: 60_000, max: 10 };
+  };
   const unreadCache = new Map<string, { value: unknown; expires: number }>();
   const mail = async (to: string, subject: string, text: string) => {
     if (!sendMail) return;
@@ -108,13 +117,31 @@ export function buildApp({ db, origin, secureCookies = false, sendMail, teamEmai
     if (['POST', 'PATCH', 'PUT', 'DELETE'].includes(request.method) && request.headers.origin !== origin) {
       return fail(reply, 403, 'Невірне джерело запиту.');
     }
-    if (request.method === 'POST' && (request.url.startsWith('/api/v1/auth/') || request.url.includes('/messages'))) {
-      const key = `${request.ip}:${request.url.split('?')[0]}`;
+    const path = request.url.split('?')[0];
+    if (request.method === 'POST' && (path.startsWith('/api/v1/auth/') || path.includes('/messages') || path === '/api/v1/requests' || path === '/api/v1/configurations')) {
+      const { windowMs, max } = rateLimitFor(path);
+      const key = `${request.ip}:${path}`;
       const current = Date.now();
-      const recent = (attempts.get(key) ?? []).filter((time) => current - time < 60_000);
-      if (recent.length >= (request.url.includes('/messages') ? 30 : 10)) return fail(reply, 429, 'Забагато запитів.');
-      attempts.set(key, [...recent, current]);
-      if (attempts.size > 10_000) attempts.clear();
+      const recent = (attempts.get(key) ?? []).filter((time) => current - time < windowMs);
+      if (recent.length >= max) {
+        reply.header('Retry-After', String(Math.max(1, Math.ceil((windowMs - (current - recent[0])) / 1000))));
+        return fail(reply, 429, 'Забагато запитів. Спробуйте пізніше.');
+      }
+      recent.push(current);
+      attempts.set(key, recent);
+      // Не очищаємо весь лімітер одним стрибком: спершу прибираємо застарілі ключі,
+      // далі — найстаріші, щоб памʼять не росла безмежно.
+      if (attempts.size > 10_000) {
+        const staleBefore = current - 15 * 60_000;
+        for (const [entry, times] of attempts) {
+          if (attempts.size <= 9_000) break;
+          if (!times.some((time) => time > staleBefore)) attempts.delete(entry);
+        }
+        for (const entry of attempts.keys()) {
+          if (attempts.size <= 9_000) break;
+          attempts.delete(entry);
+        }
+      }
     }
   });
   app.addHook('onSend', async (_request, reply, payload) => {
@@ -128,7 +155,15 @@ export function buildApp({ db, origin, secureCookies = false, sendMail, teamEmai
     app.log.error({ event: 'api_error' });
     return fail(reply, 500, 'Помилка сервера.');
   });
-  app.get('/api/v1/health', async () => ({ ok: db.pragma('quick_check', { simple: true }) === 'ok' }));
+  let healthCache = { ok: true, checkedAt: 0 };
+  app.get('/api/v1/health', async () => {
+    // quick_check на великій базі недешевий, а endpoint публічний: кешуємо результат,
+    // щоб запитами не можна було зайняти єдиний Durable Object.
+    if (Date.now() - healthCache.checkedAt > 30_000) {
+      healthCache = { ok: db.pragma('quick_check', { simple: true }) === 'ok', checkedAt: Date.now() };
+    }
+    return { ok: healthCache.ok };
+  });
 
   app.post('/api/v1/auth/register', async (request, reply) => {
     const body = parse(z.object({ email, password, name: z.string().trim().min(2).max(80) }).strict(), request.body, reply);
@@ -319,7 +354,7 @@ export function buildApp({ db, origin, secureCookies = false, sendMail, teamEmai
   app.get('/api/v1/requests', async (request, reply) => {
     const actor = auth(request, reply, 'customer'); if (!actor) return;
     const query = parse(page, request.query, reply); if (!query) return;
-    const items = db.prepare('SELECT id,template_id templateId,template_name templateName,status,created_at createdAt,updated_at updatedAt FROM requests WHERE customer_id=? ORDER BY created_at DESC,id DESC LIMIT ? OFFSET ?').all(actor.id, query.limit, query.offset);
+    const items = db.prepare('SELECT id,template_id templateId,template_name templateName,status,created_at createdAt,updated_at updatedAt,(SELECT m.body FROM messages m JOIN conversations c ON c.id=m.conversation_id WHERE c.request_id=requests.id ORDER BY m.id DESC LIMIT 1) lastMessage,(SELECT m.created_at FROM messages m JOIN conversations c ON c.id=m.conversation_id WHERE c.request_id=requests.id ORDER BY m.id DESC LIMIT 1) lastMessageAt FROM requests WHERE customer_id=? ORDER BY created_at DESC,id DESC LIMIT ? OFFSET ?').all(actor.id, query.limit, query.offset);
     return { items, nextOffset: (items as unknown[]).length === query.limit ? query.offset + query.limit : null };
   });
   app.get('/api/v1/requests/:id', async (request, reply) => {
@@ -361,6 +396,8 @@ export function buildApp({ db, origin, secureCookies = false, sendMail, teamEmai
       const result = db.prepare('INSERT INTO messages(conversation_id,sender_id,client_message_id,body,created_at) VALUES (?,?,?,?,?)').run(row.conversation_id, actor.id, body.clientMessageId, body.body, timestamp);
       if (recipient && notificationId) db.prepare(`INSERT INTO email_notifications(id,message_id,recipient,status,created_at)
         VALUES (?,?,?,'pending',?)`).run(notificationId, Number(result.lastInsertRowid), recipient, timestamp);
+      if (actor.role === 'admin') db.prepare('INSERT INTO notifications(id,recipient_id,request_id,kind,status,created_at) VALUES (?,?,?,\'message\',NULL,?)')
+        .run(randomUUID(), row.customer_id, row.id, timestamp);
       return Number(result.lastInsertRowid);
     })();
     if (notificationId) await deliverNotification(notificationId);
@@ -392,6 +429,21 @@ export function buildApp({ db, origin, secureCookies = false, sendMail, teamEmai
     unreadCache.set(actor.id, { value, expires: Date.now() + 10_000 });
     return value;
   });
+  app.get('/api/v1/notifications', async (request, reply) => {
+    const actor = auth(request, reply, 'customer'); if (!actor) return;
+    const items = db.prepare(`SELECT n.id,n.request_id requestId,n.kind,n.status,n.created_at createdAt,n.read_at readAt,r.template_name templateName
+      FROM notifications n JOIN requests r ON r.id=n.request_id
+      WHERE n.recipient_id=? ORDER BY n.created_at DESC,n.rowid DESC LIMIT 30`).all(actor.id);
+    const unread = (db.prepare('SELECT COUNT(*) count FROM notifications WHERE recipient_id=? AND read_at IS NULL').get(actor.id) as { count: number }).count;
+    return { items, unread };
+  });
+  app.patch('/api/v1/notifications/requests/:id/read', async (request, reply) => {
+    const actor = auth(request, reply, 'customer'); if (!actor) return;
+    const requestId = (request.params as { id: string }).id;
+    if (!db.prepare('SELECT id FROM requests WHERE id=? AND customer_id=?').get(requestId, actor.id)) return fail(reply, 404, 'Не знайдено.');
+    db.prepare('UPDATE notifications SET read_at=? WHERE recipient_id=? AND request_id=? AND read_at IS NULL').run(now(), actor.id, requestId);
+    return reply.code(204).send();
+  });
 
   app.get('/api/v1/admin/customers', async (request, reply) => {
     if (!auth(request, reply, 'admin')) return;
@@ -408,7 +460,7 @@ export function buildApp({ db, origin, secureCookies = false, sendMail, teamEmai
   app.get('/api/v1/admin/requests', async (request, reply) => {
     if (!auth(request, reply, 'admin')) return;
     const query = parse(page.extend({ status: z.enum(statuses).optional() }), request.query, reply); if (!query) return;
-    const sql = `SELECT r.id,r.customer_id customerId,u.name customerName,r.template_id templateId,r.template_name templateName,r.status,r.status_version statusVersion,r.created_at createdAt,r.updated_at updatedAt FROM requests r JOIN users u ON u.id=r.customer_id`;
+    const sql = `SELECT r.id,r.customer_id customerId,u.name customerName,r.template_id templateId,r.template_name templateName,r.status,r.status_version statusVersion,r.created_at createdAt,r.updated_at updatedAt,(SELECT m.body FROM messages m JOIN conversations c ON c.id=m.conversation_id WHERE c.request_id=r.id ORDER BY m.id DESC LIMIT 1) lastMessage,(SELECT m.created_at FROM messages m JOIN conversations c ON c.id=m.conversation_id WHERE c.request_id=r.id ORDER BY m.id DESC LIMIT 1) lastMessageAt FROM requests r JOIN users u ON u.id=r.customer_id`;
     const items = query.status ? db.prepare(`${sql} WHERE r.status=? ORDER BY r.updated_at DESC,r.id DESC LIMIT ? OFFSET ?`).all(query.status, query.limit, query.offset) : db.prepare(`${sql} ORDER BY r.updated_at DESC,r.id DESC LIMIT ? OFFSET ?`).all(query.limit, query.offset);
     return { items, nextOffset: (items as unknown[]).length === query.limit ? query.offset + query.limit : null };
   });
@@ -423,6 +475,8 @@ export function buildApp({ db, origin, secureCookies = false, sendMail, teamEmai
     db.transaction(() => {
       db.prepare('UPDATE requests SET status=?,status_version=status_version+1,updated_at=? WHERE id=?').run(body.status, now(), row.id);
       db.prepare('INSERT INTO request_events(id,request_id,actor_id,old_status,new_status,reason,created_at) VALUES (?,?,?,?,?,?,?)').run(randomUUID(), row.id, actor.id, row.status, body.status, body.reason, now());
+      db.prepare("INSERT INTO notifications(id,recipient_id,request_id,kind,status,created_at) VALUES (?,?,?,'status',?,?)")
+        .run(randomUUID(), row.customer_id, row.id, body.status, now());
       audit(db, actor.id, 'request.status', 'request', row.id);
     })();
     return { id: row.id, status: body.status, statusVersion: version + 1 };
@@ -438,6 +492,8 @@ export function buildApp({ db, origin, secureCookies = false, sendMail, teamEmai
     db.transaction(() => {
       db.prepare("UPDATE requests SET status='reviewing',status_version=status_version+1,updated_at=? WHERE id=?").run(now(), row.id);
       db.prepare('INSERT INTO request_events(id,request_id,actor_id,old_status,new_status,reason,created_at) VALUES (?,?,?,?,?,?,?)').run(randomUUID(), row.id, actor.id, row.status, 'reviewing', body.reason, now());
+      db.prepare("INSERT INTO notifications(id,recipient_id,request_id,kind,status,created_at) VALUES (?,?,?,'status','reviewing',?)")
+        .run(randomUUID(), row.customer_id, row.id, now());
       audit(db, actor.id, 'request.reopen', 'request', row.id);
     })();
     return { id: row.id, status: 'reviewing', statusVersion: version + 1 };
@@ -475,3 +531,6 @@ export function buildApp({ db, origin, secureCookies = false, sendMail, teamEmai
   });
   return app;
 }
+
+
+

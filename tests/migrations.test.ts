@@ -86,7 +86,7 @@ test('unknown future and incompatible legacy schemas are rejected without changi
   }
 });
 
-test('version 1 advances to version 2 without changing existing records', () => {
+test('version 1 advances to the latest schema without changing existing records', () => {
   const directory = mkdtempSync(join(tmpdir(), 'seltivo-migration-'));
   const filename = join(directory, 'v1.db');
   try {
@@ -96,7 +96,7 @@ test('version 1 advances to version 2 without changing existing records', () => 
     old.prepare("INSERT INTO users(id,email,password_hash,role,name,created_at,updated_at) VALUES ('u1','v1@example.test','hash','customer','Previous','2026-01-01','2026-01-01')").run();
     old.close();
     const migrated = openDatabase(filename);
-    assert.equal(migrated.pragma('user_version', { simple: true }), 2);
+    assert.equal(migrated.pragma('user_version', { simple: true }), 3);
     assert.equal((migrated.prepare("SELECT name FROM users WHERE id='u1'").get() as { name: string }).name, 'Previous');
     assert.equal((migrated.prepare('SELECT COUNT(*) AS count FROM email_notifications').get() as { count: number }).count, 0);
     migrated.close();

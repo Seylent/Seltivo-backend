@@ -148,8 +148,11 @@ export class SeltivoData extends DurableObject<Env> {
         return Response.json({ error: 'Backup failed' }, { status: 500 });
       }
     }
+    const declaredLength = Number(request.headers.get('content-length') ?? 0);
+    if (declaredLength > 9 * 1024 * 1024) return Response.json({ error: 'Запит завеликий.' }, { status: 413 });
     const body = request.method === 'GET' || request.method === 'HEAD'
       ? undefined : Buffer.from(await request.arrayBuffer());
+    if (body && body.length > 9 * 1024 * 1024) return Response.json({ error: 'Запит завеликий.' }, { status: 413 });
     const result = await this.app.inject({
       method: request.method as 'GET',
       url: url.pathname + url.search,

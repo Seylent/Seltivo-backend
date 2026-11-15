@@ -50,7 +50,7 @@ test('customer deletion removes related data and the external ledger prevents ba
     assert.equal((await call('GET', '/api/v1/me', undefined, alice.cookie)).status, 401);
     assert.equal((await call('GET', '/api/v1/me', undefined, bob.cookie)).status, 200);
     assert.equal((await call('GET', `/api/v1/requests/${request.body.id}`, undefined, admin)).status, 404);
-    for (const table of ['users', 'configurations', 'requests', 'conversations', 'messages', 'email_notifications', 'request_events']) {
+    for (const table of ['users', 'configurations', 'requests', 'conversations', 'messages', 'email_notifications', 'notifications', 'request_events']) {
       const rows = db.prepare(`SELECT COUNT(*) AS count FROM ${table}`).get() as { count: number };
       if (table === 'users') assert.equal(rows.count, 2); else assert.equal(rows.count, 0);
     }

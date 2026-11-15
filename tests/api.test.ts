@@ -27,7 +27,7 @@ test('registration, ownership, idempotent requests, chat and admin status', asyn
     return login.cookie!.split(';')[0];
   };
   try {
-    const alice = await user('alice');
+    let alice = await user('alice');
     const bob = await user('bob');
     const config = await call('POST', '/api/v1/configurations', { templateId: 'fashion-01', name: 'Мій сайт', data: { id: 'brand', name: 'Brand', colors: {}, hero: {}, home: {}, products: [] } }, alice);
     assert.equal(config.status, 201);
@@ -74,6 +74,21 @@ test('registration, ownership, idempotent requests, chat and admin status', asyn
     assert.equal((await call('GET', `/api/v1/requests/${first.body.id}/messages`, undefined, alice)).body.items[0].readByRecipient, true);
     const status = await call('PATCH', `/api/v1/admin/requests/${first.body.id}/status`, { status: 'reviewing', reason: 'Розпочали' }, admin, { 'if-match': '1' });
     assert.equal(status.status, 200);
+    const adminReply = await call('POST', `/api/v1/requests/${first.body.id}/messages`, { body: 'Вітаємо, заявку прийнято', clientMessageId: randomUUID() }, admin);
+    assert.equal(adminReply.status, 201);
+    const notifications = await call('GET', '/api/v1/notifications', undefined, alice);
+    assert.equal(notifications.status, 200);
+    assert.equal(notifications.body.unread, 2);
+    assert.deepEqual(notifications.body.items.map((item: { kind: string }) => item.kind).sort(), ['message', 'status']);
+    assert.equal((await call('GET', '/api/v1/notifications', undefined, bob)).body.items.length, 0);
+    assert.equal((await call('PATCH', `/api/v1/notifications/requests/${first.body.id}/read`, {}, bob)).status, 404);
+    assert.equal((await call('POST', '/api/v1/auth/logout', {}, alice)).status, 204);
+    const returned = await call('POST', '/api/v1/auth/login', { email: 'alice@example.test', password: 'VeryStrongPass123!' });
+    const aliceAgain = returned.cookie!.split(';')[0];
+    assert.equal((await call('GET', '/api/v1/notifications', undefined, aliceAgain)).body.unread, 2);
+    assert.equal((await call('PATCH', `/api/v1/notifications/requests/${first.body.id}/read`, {}, aliceAgain)).status, 204);
+    assert.equal((await call('GET', '/api/v1/notifications', undefined, aliceAgain)).body.unread, 0);
+    alice = aliceAgain;
     assert.equal((await call('PATCH', `/api/v1/admin/requests/${first.body.id}/status`, { status: 'in_progress' }, admin2, { 'if-match': '1' })).status, 409);
     assert.equal((await call('PATCH', `/api/v1/admin/requests/${first.body.id}/status`, { status: 'in_progress' }, admin2, { 'if-match': '2' })).status, 200);
     assert.equal((await call('GET', `/api/v1/requests/${first.body.id}`, undefined, alice)).body.events.length, 3);
