@@ -34,7 +34,7 @@ function version(db: SeltivoDb): number {
 
 function assertSchema(db: SeltivoDb): void {
   if (version(db) !== latestVersion) throw new Error('Backup schema version does not match application');
-  const actual = (db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' AND name NOT IN ('schema_migrations','__miniflare_do_name')").all() as { name: string }[])
+  const actual = (db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' AND name NOT IN ('schema_migrations','__miniflare_do_name') AND substr(name,1,5) != '__cf_' AND substr(name,1,4) != '_cf_'").all() as { name: string }[])
     .map((row) => row.name).sort();
   if (JSON.stringify(actual) !== JSON.stringify([...tables].sort())) throw new Error('Backup table inventory does not match application');
 }

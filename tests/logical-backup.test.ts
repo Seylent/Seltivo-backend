@@ -119,6 +119,16 @@ test('unknown table prevents an incomplete logical backup', async () => {
   } finally { db.close(); }
 });
 
+test('Cloudflare internal KV table is excluded from the application backup', async () => {
+  const db = database();
+  try {
+    db.exec('CREATE TABLE __cf_kv (key TEXT PRIMARY KEY, value TEXT)');
+    db.exec('CREATE TABLE _cf_METADATA (key TEXT PRIMARY KEY, value TEXT)');
+    const backup = await createLogicalBackup(db, memoryStore());
+    assert.equal(backup.manifest.rowCounts.users, 0);
+  } finally { db.close(); }
+});
+
 test('logical backup restores through the Cloudflare SQL adapter', async () => {
   const source = cloudflareDatabase();
   const target = cloudflareDatabase();

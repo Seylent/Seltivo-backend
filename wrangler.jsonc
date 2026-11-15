@@ -21,5 +21,25 @@
     { "tag": "v1", "new_sqlite_classes": ["SeltivoData"] },
     { "tag": "v2", "new_sqlite_classes": ["DeletionLedger"] }
   ],
-  "observability": { "enabled": true }
+  "observability": { "enabled": true },
+  "env": {
+    "staging": {
+      "vars": {
+        "SELTIVO_PUBLIC_ORIGIN": "https://seltivo-staging.seltivostudio.workers.dev",
+        "SELTIVO_ADMIN_EMAIL": "seltivostudio@gmail.com"
+      },
+      "durable_objects": {
+        "bindings": [
+          { "name": "SELTIVO", "class_name": "SeltivoData" },
+          { "name": "SELTIVO_DELETIONS", "class_name": "DeletionLedger" }
+        ]
+      },
+      "r2_buckets": [{ "binding": "SELTIVO_BACKUP_BUCKET", "bucket_name": "seltivo-staging-backups" }],
+      "migrations": [
+        { "tag": "v1", "new_sqlite_classes": ["SeltivoData"] },
+        { "tag": "v2", "new_sqlite_classes": ["DeletionLedger"] }
+      ],
+      "observability": { "enabled": true }
+    }
+  }
 }
