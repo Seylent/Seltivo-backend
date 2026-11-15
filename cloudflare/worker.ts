@@ -5,6 +5,7 @@ import { openCloudflareDatabase } from '../src/cloudflare-db.js';
 import { createWorkerRouter } from './worker-router.js';
 import { purgeCustomer } from '../src/delete-account.js';
 import { createLogicalBackup } from '../src/logical-backup.js';
+import { pruneExpiredBackups } from '../src/backup-retention.js';
 import type { SeltivoDb } from '../src/db.js';
 export { DeletionLedger } from './deletion-ledger.js';
 
@@ -128,7 +129,19 @@ export default {
     const id = env.SELTIVO.idFromName('primary');
     return env.SELTIVO.get(id).fetch(request);
   },
-  async scheduled(_controller: ScheduledController, env: Env) {
+  async scheduled(controller: ScheduledController, env: Env) {
+    if (controller.cron === '10 * * * *') {
+      const started = Date.now();
+      try {
+        const deleted = await pruneExpiredBackups(env.SELTIVO_BACKUP_BUCKET);
+        console.log(JSON.stringify({ event: 'backup_retention_completed', deleted, durationMs: Date.now() - started }));
+      } catch (error) {
+        console.error(JSON.stringify({ event: 'backup_retention_failed', errorType: error instanceof Error ? error.name : 'unknown' }));
+        throw error;
+      }
+      return;
+    }
+    if (controller.cron !== '0 2 * * *') throw new Error('Unknown scheduled job');
     const id = env.SELTIVO.idFromName('primary');
     const response = await env.SELTIVO.get(id).fetch(new Request('https://internal.seltivo/internal/backup', { method: 'POST' }));
     if (!response.ok) throw new Error('Daily backup failed');

@@ -16,7 +16,7 @@
     ]
   },
   "r2_buckets": [{ "binding": "SELTIVO_BACKUP_BUCKET", "bucket_name": "seltivo-backups" }],
-  "triggers": { "crons": ["0 2 * * *"] },
+  "triggers": { "crons": ["0 2 * * *", "10 * * * *"] },
   "migrations": [
     { "tag": "v1", "new_sqlite_classes": ["SeltivoData"] },
     { "tag": "v2", "new_sqlite_classes": ["DeletionLedger"] }
