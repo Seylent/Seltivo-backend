@@ -51,8 +51,9 @@ test('Cloudflare SQL and router preserve login, authorization and Origin checks'
 
   const registration = await app.inject({ method: 'POST', url: '/api/v1/auth/register', headers: { origin }, payload: Buffer.from(JSON.stringify({ email: 'customer@example.com', password, name: 'Customer' })) });
   assert.equal(registration.statusCode, 201);
-  const customerLogin = await app.inject({ method: 'POST', url: '/api/v1/auth/login', headers: { origin }, payload: Buffer.from(JSON.stringify({ email: 'customer@example.com', password })) });
+  const customerLogin = await app.inject({ method: 'POST', url: '/api/v1/auth/login', headers: { origin }, payload: Buffer.from(JSON.stringify({ email: 'customer@example.com', password, rememberMe: true })) });
   assert.equal(customerLogin.statusCode, 200);
+  assert.match(String(customerLogin.headers['set-cookie']), /Max-Age=2592000; Secure/);
   sqlite.close();
 });
 

@@ -2,7 +2,7 @@ import { randomUUID } from 'node:crypto';
 import Fastify, { type FastifyInstance, type FastifyReply, type FastifyRequest } from 'fastify';
 import { z } from 'zod';
 import type { SeltivoDb } from './db.js';
-import { actorFromRequest, audit, clearSessionCookie, createSession, hashPassword, hashToken, newAuthToken, normalizeEmail, now, sessionCookie, verifyPassword, type Actor } from './auth.js';
+import { actorFromRequest, audit, clearSessionCookie, createSession, hashPassword, hashToken, newAuthToken, normalizeEmail, now, sessionCookie, sessionTokenFromRequest, verifyPassword, type Actor } from './auth.js';
 
 const id = z.uuid();
 const email = z.email().max(254);
@@ -57,6 +57,7 @@ function configJson(value: unknown): string | null {
 export function buildApp({ db, origin, secureCookies = false, sendMail, teamEmail, databaseBytes, deleteCustomer, logger = process.env.NODE_ENV !== 'test', router }: AppOptions) {
   const app = router ?? Fastify({ logger, bodyLimit: 9 * 1024 * 1024, trustProxy: process.env.SELTIVO_TRUST_PROXY === '1' });
   const attempts = new Map<string, number[]>();
+  const unreadCache = new Map<string, { value: unknown; expires: number }>();
   const mail = async (to: string, subject: string, text: string) => {
     if (!sendMail) return;
     try { await sendMail(to, subject, text); } catch { app.log.error({ event: 'email_delivery_failed', kind: 'auth' }); }
@@ -168,18 +169,22 @@ export function buildApp({ db, origin, secureCookies = false, sendMail, teamEmai
     return { ok: true };
   });
   app.post('/api/v1/auth/login', async (request, reply) => {
-    const body = parse(z.object({ email, password: z.string().max(200) }).strict(), request.body, reply);
+    const body = parse(z.object({ email, password: z.string().max(200), rememberMe: z.boolean().optional() }).strict(), request.body, reply);
     if (!body) return;
     const user = db.prepare('SELECT id,email,password_hash,role,name,email_verified_at FROM users WHERE email=? AND disabled_at IS NULL').get(normalizeEmail(body.email)) as any;
     if (!user || !await verifyPassword(body.password, user.password_hash)) return fail(reply, 401, 'Невірний email або пароль.');
-    const token = createSession(db, user.id);
+    const token = db.transaction(() => {
+      const previous = sessionTokenFromRequest(request);
+      if (previous) db.prepare('DELETE FROM sessions WHERE token_hash=?').run(hashToken(previous));
+      return createSession(db, user.id, body.rememberMe);
+    })();
     if (user.role === 'admin') audit(db, user.id, 'auth.login', 'user', user.id);
-    reply.header('Set-Cookie', sessionCookie(token, secureCookies));
+    reply.header('Set-Cookie', sessionCookie(token, secureCookies, body.rememberMe));
     return { user: { id: user.id, email: user.email, name: user.name, role: user.role, emailVerified: Boolean(user.email_verified_at) } };
   });
   app.post('/api/v1/auth/logout', async (request, reply) => {
-    const cookie = request.headers.cookie?.split(';').map((s) => s.trim()).find((s) => s.startsWith('seltivo_session='));
-    if (cookie) db.prepare('DELETE FROM sessions WHERE token_hash=?').run(hashToken(cookie.slice(16)));
+    const token = sessionTokenFromRequest(request);
+    if (token) db.prepare('DELETE FROM sessions WHERE token_hash=?').run(hashToken(token));
     reply.header('Set-Cookie', clearSessionCookie(secureCookies));
     return reply.code(204).send();
   });
@@ -359,6 +364,7 @@ export function buildApp({ db, origin, secureCookies = false, sendMail, teamEmai
       return Number(result.lastInsertRowid);
     })();
     if (notificationId) await deliverNotification(notificationId);
+    unreadCache.clear();
     return reply.code(201).send({ id: messageId, senderId: actor.id, body: body.body, createdAt: timestamp });
   });
   app.patch('/api/v1/requests/:id/read', async (request, reply) => {
@@ -369,17 +375,22 @@ export function buildApp({ db, origin, secureCookies = false, sendMail, teamEmai
     db.prepare(`INSERT INTO conversation_reads(conversation_id,user_id,last_read_message_id,read_at) VALUES (?,?,?,?)
       ON CONFLICT(conversation_id,user_id) DO UPDATE SET last_read_message_id=MAX(last_read_message_id,excluded.last_read_message_id),read_at=excluded.read_at`)
       .run(row.conversation_id, actor.id, body.lastSeenMessageId, now());
+    unreadCache.clear();
     return reply.code(204).send();
   });
   app.get('/api/v1/notifications/unread-count', async (request, reply) => {
     const actor = auth(request, reply); if (!actor) return;
+    const cached = unreadCache.get(actor.id);
+    if (cached && cached.expires > Date.now()) return cached.value;
     const rows = db.prepare(`SELECT r.id requestId,COUNT(m.id) unread FROM requests r
       JOIN conversations c ON c.request_id=r.id
       JOIN messages m ON m.conversation_id=c.id AND m.sender_id<>?
       LEFT JOIN conversation_reads cr ON cr.conversation_id=c.id AND cr.user_id=?
       WHERE (r.customer_id=? OR ?='admin') AND m.id>COALESCE(cr.last_read_message_id,0)
       GROUP BY r.id`).all(actor.id, actor.id, actor.id, actor.role) as { requestId: string; unread: number }[];
-    return { total: rows.reduce((sum, row) => sum + row.unread, 0), byRequest: rows };
+    const value = { total: rows.reduce((sum, row) => sum + row.unread, 0), byRequest: rows };
+    unreadCache.set(actor.id, { value, expires: Date.now() + 10_000 });
+    return value;
   });
 
   app.get('/api/v1/admin/customers', async (request, reply) => {

@@ -35,7 +35,7 @@ Remove-Item Env:SELTIVO_ADMIN_PASSWORD
 
 ## API
 
-Базовий шлях `/api/v1`. Для всіх POST/PATCH/DELETE передавайте `Origin`, який точно збігається з `SELTIVO_PUBLIC_ORIGIN`. Сесія — HttpOnly cookie `seltivo_session`. Приватні відповіді не слід кешувати на проксі.
+Базовий шлях `/api/v1`. Для всіх POST/PATCH/DELETE передавайте `Origin`, який точно збігається з `SELTIVO_PUBLIC_ORIGIN`. Сесія — HttpOnly cookie `seltivo_session` з `SameSite=Lax` і `Secure` на HTTPS. `POST /auth/login` приймає необов’язковий boolean `rememberMe`: `true` створює серверну сесію й cookie на 30 днів, `false` або відсутнє поле — серверну сесію на 12 годин і cookie до закриття браузера. Ключ сесії зберігається в БД лише як SHA-256 хеш; повторний вхід замінює поточну сесію, вихід анулює її. Раніше видані сесії лишаються чинними до свого попереднього строку дії. Приватні відповіді не слід кешувати на проксі.
 
 | Операція | Шлях |
 | --- | --- |

@@ -4,7 +4,8 @@ import type { FastifyRequest } from 'fastify';
 import type { SeltivoDb } from './db.js';
 
 const scrypt = promisify(scryptCallback);
-const SESSION_MS = 7 * 24 * 60 * 60 * 1000;
+const SHORT_SESSION_MS = 12 * 60 * 60 * 1000;
+const REMEMBER_SESSION_MS = 30 * 24 * 60 * 60 * 1000;
 export const now = () => new Date().toISOString();
 export const hashToken = (token: string) => createHash('sha256').update(token).digest('hex');
 export const normalizeEmail = (email: string) => email.trim().toLowerCase();
@@ -22,15 +23,15 @@ export async function verifyPassword(password: string, stored: string) {
   return timingSafeEqual(actual, Buffer.from(hex, 'hex'));
 }
 
-export function createSession(db: SeltivoDb, userId: string) {
+export function createSession(db: SeltivoDb, userId: string, rememberMe = false) {
   const token = randomBytes(32).toString('base64url');
   db.prepare('INSERT INTO sessions(token_hash,user_id,expires_at,created_at) VALUES (?,?,?,?)')
-    .run(hashToken(token), userId, new Date(Date.now() + SESSION_MS).toISOString(), now());
+    .run(hashToken(token), userId, new Date(Date.now() + (rememberMe ? REMEMBER_SESSION_MS : SHORT_SESSION_MS)).toISOString(), now());
   return token;
 }
 
-export function sessionCookie(token: string, secure: boolean) {
-  return `seltivo_session=${token}; Path=/; HttpOnly; SameSite=Lax; Max-Age=${SESSION_MS / 1000}${secure ? '; Secure' : ''}`;
+export function sessionCookie(token: string, secure: boolean, rememberMe = false) {
+  return `seltivo_session=${token}; Path=/; HttpOnly; SameSite=Lax${rememberMe ? `; Max-Age=${REMEMBER_SESSION_MS / 1000}` : ''}${secure ? '; Secure' : ''}`;
 }
 
 export function clearSessionCookie(secure: boolean) {
@@ -39,10 +40,15 @@ export function clearSessionCookie(secure: boolean) {
 
 export type Actor = { id: string; email: string; role: 'customer' | 'admin'; name: string; email_verified_at: string | null };
 
-export function actorFromRequest(db: SeltivoDb, request: FastifyRequest): Actor | null {
+export function sessionTokenFromRequest(request: FastifyRequest): string | null {
   const cookie = request.headers.cookie?.split(';').map((part) => part.trim()).find((part) => part.startsWith('seltivo_session='));
   const token = cookie?.slice('seltivo_session='.length);
-  if (!token || token.length > 100) return null;
+  return token && /^[A-Za-z0-9_-]{43}$/.test(token) ? token : null;
+}
+
+export function actorFromRequest(db: SeltivoDb, request: FastifyRequest): Actor | null {
+  const token = sessionTokenFromRequest(request);
+  if (!token) return null;
   return db.prepare(`SELECT u.id,u.email,u.role,u.name,u.email_verified_at FROM sessions s
     JOIN users u ON u.id=s.user_id WHERE s.token_hash=? AND s.expires_at>? AND u.disabled_at IS NULL`)
     .get(hashToken(token), now()) as Actor | undefined ?? null;
