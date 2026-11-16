@@ -17,11 +17,14 @@ const transitions: Record<Status, Status[]> = {
   needs_info: ['reviewing', 'in_progress', 'cancelled'], in_progress: ['needs_info', 'completed', 'cancelled'],
   completed: [], cancelled: [],
 };
-const datePlus = (ms: number) => new Date(Date.now() + ms).toISOString();
 const fail = (reply: FastifyReply, status: number, error: string) => reply.code(status).send({ error });
 
 type Mail = (to: string, subject: string, text: string) => Promise<void>;
-export type AppOptions = { db: SeltivoDb; origin: string; secureCookies?: boolean; sendMail?: Mail; teamEmail?: string; databaseBytes?: () => number; deleteCustomer?: (userId: string) => Promise<void>; logger?: boolean; router?: FastifyInstance };
+export type AppOptions = { db: SeltivoDb; origin: string; secureCookies?: boolean; requireEmailVerification?: boolean; sendMail?: Mail; teamEmail?: string; databaseBytes?: () => number; deleteCustomer?: (userId: string) => Promise<void>; logger?: boolean; router?: FastifyInstance };
+const MAX_CONFIGURATIONS_PER_USER = 50;
+const RETENTION_MS = 30 * 24 * 60 * 60 * 1000;
+const PNG_SIGNATURE = Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]);
+const JPEG_SIGNATURE = Buffer.from([255, 216, 255]);
 
 function parse<T>(schema: z.ZodType<T>, body: unknown, reply: FastifyReply): T | null {
   const result = schema.safeParse(body);
@@ -33,38 +36,88 @@ function configJson(value: unknown): string | null {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
   const data = value as Record<string, unknown>;
   if (typeof data.name !== 'string' || typeof data.id !== 'string' || !data.colors || !data.hero || !data.home || !Array.isArray(data.products)) return null;
-  const json = JSON.stringify(value);
-  if (Buffer.byteLength(json) > 8 * 1024 * 1024) return null;
   let images = 0;
   const walk = (node: unknown, depth: number): boolean => {
     if (depth > 30) return false;
     if (typeof node === 'string' && node.startsWith('data:')) {
       const match = /^data:image\/(png|jpeg|webp);base64,([A-Za-z0-9+/]+={0,2})$/.exec(node);
-      if (!match || ++images > 30 || match[2].length > 2_800_000) return false;
-      const bytes = Buffer.from(match[2], 'base64');
-      const signature = bytes.subarray(0, 12);
-      return match[1] === 'png' ? signature.subarray(0, 8).equals(Buffer.from([137,80,78,71,13,10,26,10]))
-        : match[1] === 'jpeg' ? signature.subarray(0, 3).equals(Buffer.from([255,216,255]))
+      if (!match || ++images > 30 || match[2].length < 16 || match[2].length > 2_800_000 || match[2].length % 4 !== 0) return false;
+      // Перші 16 символів base64 містять рівно 12 байтів заголовка зображення —
+      // не декодуємо весь 2 МБ буфер кожного зображення в памʼять.
+      const signature = Buffer.from(match[2].slice(0, 16), 'base64');
+      return match[1] === 'png' ? signature.subarray(0, 8).equals(PNG_SIGNATURE)
+        : match[1] === 'jpeg' ? signature.subarray(0, 3).equals(JPEG_SIGNATURE)
         : signature.toString('ascii', 0, 4) === 'RIFF' && signature.toString('ascii', 8, 12) === 'WEBP';
     }
     if (Array.isArray(node)) return node.every((item) => walk(item, depth + 1));
     if (node && typeof node === 'object') return Object.values(node).every((item) => walk(item, depth + 1));
     return true;
   };
-  return walk(value, 0) ? json : null;
+  if (!walk(value, 0)) return null;
+  const json = JSON.stringify(value);
+  return Buffer.byteLength(json) <= 8 * 1024 * 1024 ? json : null;
 }
 
-export function buildApp({ db, origin, secureCookies = false, sendMail, teamEmail, databaseBytes, deleteCustomer, logger = process.env.NODE_ENV !== 'test', router }: AppOptions) {
+export function buildApp({ db, origin, secureCookies = false, requireEmailVerification = process.env.SELTIVO_REQUIRE_EMAIL_VERIFICATION === '1', sendMail, teamEmail, databaseBytes, deleteCustomer, logger = process.env.NODE_ENV !== 'test', router }: AppOptions) {
   const app = router ?? Fastify({ logger, bodyLimit: 9 * 1024 * 1024, trustProxy: process.env.SELTIVO_TRUST_PROXY === '1' });
   const attempts = new Map<string, number[]>();
-  const rateLimitFor = (path: string) => {
-    if (path.endsWith('/auth/register') || path.endsWith('/auth/forgot-password') || path.endsWith('/auth/resend-verification')) {
-      return { windowMs: 15 * 60_000, max: 5 };
+  const pruneAttempts = (current: number) => {
+    if (attempts.size <= 10_000) return;
+    const staleBefore = current - 15 * 60_000;
+    for (const [entry, times] of attempts) {
+      if (attempts.size <= 9_000) break;
+      if (!times.some((time) => time > staleBefore)) attempts.delete(entry);
     }
-    if (path === '/api/v1/requests') return { windowMs: 10 * 60_000, max: 5 };
-    if (path === '/api/v1/configurations') return { windowMs: 10 * 60_000, max: 20 };
-    if (path.includes('/messages')) return { windowMs: 60_000, max: 30 };
-    return { windowMs: 60_000, max: 10 };
+    for (const entry of attempts.keys()) {
+      if (attempts.size <= 9_000) break;
+      attempts.delete(entry);
+    }
+  };
+  const checkRateLimit = (key: string, windowMs: number, max: number, reply: FastifyReply, record = true): boolean => {
+    const current = Date.now();
+    const recent = (attempts.get(key) ?? []).filter((time) => current - time < windowMs);
+    if (recent.length >= max) {
+      reply.header('Retry-After', String(Math.max(1, Math.ceil((windowMs - (current - recent[0])) / 1000))));
+      fail(reply, 429, 'Забагато запитів. Спробуйте пізніше.');
+      return false;
+    }
+    if (record) {
+      recent.push(current);
+      attempts.set(key, recent);
+      pruneAttempts(current);
+    } else if (recent.length) {
+      attempts.set(key, recent);
+    } else {
+      attempts.delete(key);
+    }
+    return true;
+  };
+  const recordAttempt = (key: string, windowMs: number) => {
+    const current = Date.now();
+    const recent = (attempts.get(key) ?? []).filter((time) => current - time < windowMs);
+    recent.push(current);
+    attempts.set(key, recent);
+    pruneAttempts(current);
+  };
+  const rateLimitBucket = (method: string, rawPath: string): { bucket: string; windowMs: number; max: number } | null => {
+    const path = rawPath.length > 1 ? rawPath.replace(/\/+$/, '') : rawPath;
+    if (method === 'POST') {
+      if (path === '/api/v1/auth/register' || path === '/api/v1/auth/forgot-password' || path === '/api/v1/auth/resend-verification') {
+        return { bucket: `POST:${path}`, windowMs: 15 * 60_000, max: 5 };
+      }
+      if (path.startsWith('/api/v1/auth/')) return { bucket: `POST:${path}`, windowMs: 60_000, max: 10 };
+      if (path === '/api/v1/requests') return { bucket: 'POST:/api/v1/requests', windowMs: 10 * 60_000, max: 5 };
+      if (path === '/api/v1/configurations') return { bucket: 'WRITE:/api/v1/configurations', windowMs: 10 * 60_000, max: 20 };
+      if (/^\/api\/v1\/requests\/[^/]+\/messages$/.test(path) || path.includes('/messages')) {
+        return { bucket: 'POST:/api/v1/requests/:id/messages', windowMs: 60_000, max: 30 };
+      }
+    }
+    if (method === 'PATCH') {
+      if (/^\/api\/v1\/configurations\/[^/]+$/.test(path)) return { bucket: 'WRITE:/api/v1/configurations', windowMs: 10 * 60_000, max: 20 };
+      if (path === '/api/v1/me') return { bucket: 'PATCH:/api/v1/me', windowMs: 60_000, max: 20 };
+    }
+    if (method === 'DELETE' && path === '/api/v1/me') return { bucket: 'DELETE:/api/v1/me', windowMs: 60_000, max: 10 };
+    return null;
   };
   const unreadCache = new Map<string, { value: unknown; expires: number }>();
   const mail = async (to: string, subject: string, text: string) => {
@@ -91,7 +144,10 @@ export function buildApp({ db, origin, secureCookies = false, sendMail, teamEmai
     try {
       if (!sendMail) throw new Error('mail_not_configured');
       await sendMail(row.recipient, subject, text);
-      db.prepare("UPDATE email_notifications SET status='sent',sent_at=?,last_error_code=NULL WHERE id=?").run(now(), notificationId);
+      const sentAt = now();
+      const retentionCutoff = new Date(Date.now() - RETENTION_MS).toISOString();
+      db.prepare("UPDATE email_notifications SET status='sent',sent_at=?,last_error_code=NULL WHERE id=?").run(sentAt, notificationId);
+      db.prepare("DELETE FROM email_notifications WHERE status='sent' AND sent_at<?").run(retentionCutoff);
       return 'sent';
     } catch {
       const code = sendMail ? 'provider_error' : 'mail_not_configured';
@@ -117,42 +173,30 @@ export function buildApp({ db, origin, secureCookies = false, sendMail, teamEmai
     if (['POST', 'PATCH', 'PUT', 'DELETE'].includes(request.method) && request.headers.origin !== origin) {
       return fail(reply, 403, 'Невірне джерело запиту.');
     }
-    const path = request.url.split('?')[0];
-    if (request.method === 'POST' && (path.startsWith('/api/v1/auth/') || path.includes('/messages') || path === '/api/v1/requests' || path === '/api/v1/configurations')) {
-      const { windowMs, max } = rateLimitFor(path);
-      const key = `${request.ip}:${path}`;
-      const current = Date.now();
-      const recent = (attempts.get(key) ?? []).filter((time) => current - time < windowMs);
-      if (recent.length >= max) {
-        reply.header('Retry-After', String(Math.max(1, Math.ceil((windowMs - (current - recent[0])) / 1000))));
-        return fail(reply, 429, 'Забагато запитів. Спробуйте пізніше.');
-      }
-      recent.push(current);
-      attempts.set(key, recent);
-      // Не очищаємо весь лімітер одним стрибком: спершу прибираємо застарілі ключі,
-      // далі — найстаріші, щоб памʼять не росла безмежно.
-      if (attempts.size > 10_000) {
-        const staleBefore = current - 15 * 60_000;
-        for (const [entry, times] of attempts) {
-          if (attempts.size <= 9_000) break;
-          if (!times.some((time) => time > staleBefore)) attempts.delete(entry);
-        }
-        for (const entry of attempts.keys()) {
-          if (attempts.size <= 9_000) break;
-          attempts.delete(entry);
-        }
-      }
+    const rawPath = request.url.split('?')[0];
+    const limit = rateLimitBucket(request.method, rawPath);
+    if (limit) {
+      checkRateLimit(`${request.ip}:${limit.bucket}`, limit.windowMs, limit.max, reply);
     }
   });
   app.addHook('onSend', async (_request, reply, payload) => {
     reply.header('Cache-Control', 'private, no-store');
+    reply.header('X-Content-Type-Options', 'nosniff');
+    reply.header('X-Frame-Options', 'DENY');
+    reply.header('Referrer-Policy', 'no-referrer');
+    reply.header('Vary', 'Origin, Cookie');
     return payload;
   });
-  app.setErrorHandler((error, _request, reply) => {
+  app.setErrorHandler((error, request, reply) => {
     if (typeof error === 'object' && error && 'statusCode' in error && typeof error.statusCode === 'number' && error.statusCode >= 400 && error.statusCode < 500) {
       return fail(reply, error.statusCode, error.statusCode === 413 ? 'Запит завеликий.' : 'Невірний формат запиту.');
     }
-    app.log.error({ event: 'api_error' });
+    app.log.error({
+      event: 'api_error',
+      method: request.method,
+      path: request.url.split('?')[0],
+      errorType: error instanceof Error ? error.name : 'unknown',
+    });
     return fail(reply, 500, 'Помилка сервера.');
   });
   let healthCache = { ok: true, checkedAt: 0 };
@@ -173,14 +217,19 @@ export function buildApp({ db, origin, secureCookies = false, sendMail, teamEmai
     const userId = randomUUID();
     const timestamp = now();
     const hash = await hashPassword(body.password);
+    const verifiedAt = requireEmailVerification ? null : timestamp;
     try {
       db.prepare(`INSERT INTO users(id,email,password_hash,role,name,email_verified_at,created_at,updated_at) VALUES (?,?,?,'customer',?,?,?,?)`)
-        .run(userId, normalized, hash, body.name, timestamp, timestamp, timestamp);
+        .run(userId, normalized, hash, body.name, verifiedAt, timestamp, timestamp);
     } catch (error) {
       if (error instanceof Error && error.message.includes('UNIQUE constraint failed: users.email')) return fail(reply, 409, 'Акаунт із цим email уже існує.');
       throw error;
     }
-    return reply.code(201).send({ id: userId, verificationRequired: false });
+    if (requireEmailVerification && sendMail) {
+      const token = newAuthToken(db, userId, 'verify', 24 * 60 * 60 * 1000);
+      await mail(normalized, 'Підтвердьте email SELTIVO', `${origin}/verify-email?token=${token}`);
+    }
+    return reply.code(201).send({ id: userId, verificationRequired: requireEmailVerification });
   });
   app.post('/api/v1/auth/resend-verification', async (request, reply) => {
     const body = parse(z.object({ email }).strict(), request.body, reply);
@@ -206,8 +255,15 @@ export function buildApp({ db, origin, secureCookies = false, sendMail, teamEmai
   app.post('/api/v1/auth/login', async (request, reply) => {
     const body = parse(z.object({ email, password: z.string().max(200), rememberMe: z.boolean().optional() }).strict(), request.body, reply);
     if (!body) return;
-    const user = db.prepare('SELECT id,email,password_hash,role,name,email_verified_at FROM users WHERE email=? AND disabled_at IS NULL').get(normalizeEmail(body.email)) as any;
-    if (!user || !await verifyPassword(body.password, user.password_hash)) return fail(reply, 401, 'Невірний email або пароль.');
+    const normalized = normalizeEmail(body.email);
+    const emailLimitKey = `email:login:${normalized}`;
+    if (!checkRateLimit(emailLimitKey, 15 * 60_000, 10, reply, false)) return;
+    const user = db.prepare('SELECT id,email,password_hash,role,name,email_verified_at FROM users WHERE email=? AND disabled_at IS NULL').get(normalized) as any;
+    if (!await verifyPassword(body.password, user?.password_hash) || !user) {
+      recordAttempt(emailLimitKey, 15 * 60_000);
+      return fail(reply, 401, 'Невірний email або пароль.');
+    }
+    attempts.delete(emailLimitKey);
     const token = db.transaction(() => {
       const previous = sessionTokenFromRequest(request);
       if (previous) db.prepare('DELETE FROM sessions WHERE token_hash=?').run(hashToken(previous));
@@ -262,16 +318,17 @@ export function buildApp({ db, origin, secureCookies = false, sendMail, teamEmai
   app.delete('/api/v1/me', async (request, reply) => {
     const actor = auth(request, reply, 'customer'); if (!actor) return;
     if (!deleteCustomer) return fail(reply, 503, 'Видалення акаунта тимчасово недоступне.');
-    const body = parse(z.object({ password }).strict(), request.body, reply); if (!body) return;
+    const body = parse(z.object({ password: z.string().min(1).max(200) }).strict(), request.body, reply); if (!body) return;
     const row = db.prepare('SELECT password_hash FROM users WHERE id=?').get(actor.id) as { password_hash: string };
     if (!await verifyPassword(body.password, row.password_hash)) return fail(reply, 401, 'Невірний пароль.');
     await deleteCustomer(actor.id);
+    unreadCache.clear();
     reply.header('Set-Cookie', clearSessionCookie(secureCookies));
     return reply.code(204).send();
   });
   app.post('/api/v1/auth/change-password', async (request, reply) => {
     const actor = auth(request, reply); if (!actor) return;
-    const body = parse(z.object({ currentPassword: z.string(), newPassword: password }).strict(), request.body, reply);
+    const body = parse(z.object({ currentPassword: z.string().min(1).max(200), newPassword: password }).strict(), request.body, reply);
     if (!body) return;
     const row = db.prepare('SELECT password_hash FROM users WHERE id=?').get(actor.id) as { password_hash: string };
     if (!await verifyPassword(body.currentPassword, row.password_hash)) return fail(reply, 401, 'Невірний поточний пароль.');
@@ -279,6 +336,7 @@ export function buildApp({ db, origin, secureCookies = false, sendMail, teamEmai
     const hash = await hashPassword(body.newPassword);
     db.transaction(() => {
       db.prepare('UPDATE users SET password_hash=?,updated_at=? WHERE id=?').run(hash, now(), actor.id);
+      db.prepare("DELETE FROM auth_tokens WHERE user_id=? AND purpose='reset'").run(actor.id);
       db.prepare('DELETE FROM sessions WHERE user_id=?').run(actor.id);
     })();
     reply.header('Set-Cookie', clearSessionCookie(secureCookies));
@@ -295,6 +353,8 @@ export function buildApp({ db, origin, secureCookies = false, sendMail, teamEmai
   app.post('/api/v1/configurations', async (request, reply) => {
     const actor = auth(request, reply, 'customer'); if (!actor || !verified(actor, reply)) return;
     const body = parse(configBody, request.body, reply); if (!body) return;
+    const activeCount = (db.prepare('SELECT COUNT(*) AS count FROM configurations WHERE owner_id=? AND deleted_at IS NULL').get(actor.id) as { count: number }).count;
+    if (activeCount >= MAX_CONFIGURATIONS_PER_USER) return fail(reply, 422, 'Досягнуто ліміту збережених конфігурацій.');
     const json = configJson(body.data); if (!json) return fail(reply, 422, 'Конфігурація завелика або пошкоджена.');
     const configId = randomUUID(), timestamp = now();
     db.prepare('INSERT INTO configurations(id,owner_id,template_id,name,data_json,created_at,updated_at) VALUES (?,?,?,?,?,?,?)')
@@ -321,7 +381,8 @@ export function buildApp({ db, origin, secureCookies = false, sendMail, teamEmai
   });
   app.delete('/api/v1/configurations/:id', async (request, reply) => {
     const actor = auth(request, reply, 'customer'); if (!actor) return;
-    const result = db.prepare('UPDATE configurations SET deleted_at=? WHERE id=? AND owner_id=? AND deleted_at IS NULL').run(now(), (request.params as any).id, actor.id);
+    // Заявки зберігають власний config_snapshot_json, тому звільняємо data_json при приховуванні.
+    const result = db.prepare("UPDATE configurations SET data_json='{}',deleted_at=? WHERE id=? AND owner_id=? AND deleted_at IS NULL").run(now(), (request.params as any).id, actor.id);
     if (!result.changes) return fail(reply, 404, 'Не знайдено.');
     return reply.code(204).send();
   });
@@ -354,13 +415,17 @@ export function buildApp({ db, origin, secureCookies = false, sendMail, teamEmai
   app.get('/api/v1/requests', async (request, reply) => {
     const actor = auth(request, reply, 'customer'); if (!actor) return;
     const query = parse(page, request.query, reply); if (!query) return;
-    const items = db.prepare('SELECT id,template_id templateId,template_name templateName,status,created_at createdAt,updated_at updatedAt,(SELECT m.body FROM messages m JOIN conversations c ON c.id=m.conversation_id WHERE c.request_id=requests.id ORDER BY m.id DESC LIMIT 1) lastMessage,(SELECT m.created_at FROM messages m JOIN conversations c ON c.id=m.conversation_id WHERE c.request_id=requests.id ORDER BY m.id DESC LIMIT 1) lastMessageAt FROM requests WHERE customer_id=? ORDER BY created_at DESC,id DESC LIMIT ? OFFSET ?').all(actor.id, query.limit, query.offset);
+    const items = db.prepare(`SELECT r.id,r.template_id templateId,r.template_name templateName,r.status,r.created_at createdAt,r.updated_at updatedAt,
+      (SELECT m.body FROM messages m WHERE m.conversation_id=c.id ORDER BY m.id DESC LIMIT 1) lastMessage,
+      (SELECT m.created_at FROM messages m WHERE m.conversation_id=c.id ORDER BY m.id DESC LIMIT 1) lastMessageAt
+      FROM requests r JOIN conversations c ON c.request_id=r.id
+      WHERE r.customer_id=? ORDER BY r.created_at DESC,r.id DESC LIMIT ? OFFSET ?`).all(actor.id, query.limit, query.offset);
     return { items, nextOffset: (items as unknown[]).length === query.limit ? query.offset + query.limit : null };
   });
   app.get('/api/v1/requests/:id', async (request, reply) => {
     const actor = auth(request, reply); if (!actor) return;
     const row = requestRow((request.params as any).id, actor); if (!row) return fail(reply, 404, 'Не знайдено.');
-    const events = db.prepare('SELECT old_status oldStatus,new_status newStatus,reason,created_at createdAt FROM request_events WHERE request_id=? ORDER BY created_at').all(row.id);
+    const events = db.prepare('SELECT old_status oldStatus,new_status newStatus,reason,created_at createdAt FROM request_events WHERE request_id=? ORDER BY created_at,rowid').all(row.id);
     return { id: row.id, customerId: row.customer_id, templateId: row.template_id, templateName: row.template_name, status: row.status, statusVersion: row.status_version, configuration: row.config_snapshot_json ? JSON.parse(row.config_snapshot_json) : null, contact: JSON.parse(row.contact_json), note: row.note, features: JSON.parse(row.features_json), conversationId: row.conversation_id, events, createdAt: row.created_at };
   });
   app.get('/api/v1/requests/:id/messages', async (request, reply) => {
@@ -412,13 +477,17 @@ export function buildApp({ db, origin, secureCookies = false, sendMail, teamEmai
     db.prepare(`INSERT INTO conversation_reads(conversation_id,user_id,last_read_message_id,read_at) VALUES (?,?,?,?)
       ON CONFLICT(conversation_id,user_id) DO UPDATE SET last_read_message_id=MAX(last_read_message_id,excluded.last_read_message_id),read_at=excluded.read_at`)
       .run(row.conversation_id, actor.id, body.lastSeenMessageId, now());
-    unreadCache.clear();
+    unreadCache.delete(actor.id);
     return reply.code(204).send();
   });
   app.get('/api/v1/notifications/unread-count', async (request, reply) => {
     const actor = auth(request, reply); if (!actor) return;
+    const current = Date.now();
     const cached = unreadCache.get(actor.id);
-    if (cached && cached.expires > Date.now()) return cached.value;
+    if (cached) {
+      if (cached.expires > current) return cached.value;
+      unreadCache.delete(actor.id);
+    }
     const rows = db.prepare(`SELECT r.id requestId,COUNT(m.id) unread FROM requests r
       JOIN conversations c ON c.request_id=r.id
       JOIN messages m ON m.conversation_id=c.id AND m.sender_id<>?
@@ -426,7 +495,12 @@ export function buildApp({ db, origin, secureCookies = false, sendMail, teamEmai
       WHERE (r.customer_id=? OR ?='admin') AND m.id>COALESCE(cr.last_read_message_id,0)
       GROUP BY r.id`).all(actor.id, actor.id, actor.id, actor.role) as { requestId: string; unread: number }[];
     const value = { total: rows.reduce((sum, row) => sum + row.unread, 0), byRequest: rows };
-    unreadCache.set(actor.id, { value, expires: Date.now() + 10_000 });
+    if (unreadCache.size > 5_000) {
+      for (const [idKey, entry] of unreadCache) {
+        if (entry.expires <= current || unreadCache.size > 4_500) unreadCache.delete(idKey);
+      }
+    }
+    unreadCache.set(actor.id, { value, expires: current + 10_000 });
     return value;
   });
   app.get('/api/v1/notifications', async (request, reply) => {
@@ -441,7 +515,10 @@ export function buildApp({ db, origin, secureCookies = false, sendMail, teamEmai
     const actor = auth(request, reply, 'customer'); if (!actor) return;
     const requestId = (request.params as { id: string }).id;
     if (!db.prepare('SELECT id FROM requests WHERE id=? AND customer_id=?').get(requestId, actor.id)) return fail(reply, 404, 'Не знайдено.');
-    db.prepare('UPDATE notifications SET read_at=? WHERE recipient_id=? AND request_id=? AND read_at IS NULL').run(now(), actor.id, requestId);
+    const readAt = now();
+    const retentionCutoff = new Date(Date.now() - RETENTION_MS).toISOString();
+    db.prepare('UPDATE notifications SET read_at=? WHERE recipient_id=? AND request_id=? AND read_at IS NULL').run(readAt, actor.id, requestId);
+    db.prepare('DELETE FROM notifications WHERE read_at IS NOT NULL AND read_at<?').run(retentionCutoff);
     return reply.code(204).send();
   });
 
@@ -460,7 +537,7 @@ export function buildApp({ db, origin, secureCookies = false, sendMail, teamEmai
   app.get('/api/v1/admin/requests', async (request, reply) => {
     if (!auth(request, reply, 'admin')) return;
     const query = parse(page.extend({ status: z.enum(statuses).optional() }), request.query, reply); if (!query) return;
-    const sql = `SELECT r.id,r.customer_id customerId,u.name customerName,r.template_id templateId,r.template_name templateName,r.status,r.status_version statusVersion,r.created_at createdAt,r.updated_at updatedAt,(SELECT m.body FROM messages m JOIN conversations c ON c.id=m.conversation_id WHERE c.request_id=r.id ORDER BY m.id DESC LIMIT 1) lastMessage,(SELECT m.created_at FROM messages m JOIN conversations c ON c.id=m.conversation_id WHERE c.request_id=r.id ORDER BY m.id DESC LIMIT 1) lastMessageAt FROM requests r JOIN users u ON u.id=r.customer_id`;
+    const sql = `SELECT r.id,r.customer_id customerId,u.name customerName,r.template_id templateId,r.template_name templateName,r.status,r.status_version statusVersion,r.created_at createdAt,r.updated_at updatedAt,(SELECT m.body FROM messages m WHERE m.conversation_id=c.id ORDER BY m.id DESC LIMIT 1) lastMessage,(SELECT m.created_at FROM messages m WHERE m.conversation_id=c.id ORDER BY m.id DESC LIMIT 1) lastMessageAt FROM requests r JOIN users u ON u.id=r.customer_id JOIN conversations c ON c.request_id=r.id`;
     const items = query.status ? db.prepare(`${sql} WHERE r.status=? ORDER BY r.updated_at DESC,r.id DESC LIMIT ? OFFSET ?`).all(query.status, query.limit, query.offset) : db.prepare(`${sql} ORDER BY r.updated_at DESC,r.id DESC LIMIT ? OFFSET ?`).all(query.limit, query.offset);
     return { items, nextOffset: (items as unknown[]).length === query.limit ? query.offset + query.limit : null };
   });
@@ -486,7 +563,7 @@ export function buildApp({ db, origin, secureCookies = false, sendMail, teamEmai
     const body = parse(z.object({ reason: z.string().trim().min(3).max(500) }).strict(), request.body, reply); if (!body) return;
     const version = Number(request.headers['if-match']);
     if (!Number.isInteger(version) || version < 1) return fail(reply, 400, 'Потрібна версія If-Match.');
-    const row = db.prepare('SELECT id,status,status_version FROM requests WHERE id=?').get((request.params as any).id) as any;
+    const row = db.prepare('SELECT id,status,status_version,customer_id FROM requests WHERE id=?').get((request.params as any).id) as any;
     if (!row) return fail(reply, 404, 'Не знайдено.');
     if (row.status_version !== version || !['completed', 'cancelled'].includes(row.status)) return fail(reply, 409, 'Заявка не завершена або версія застаріла.');
     db.transaction(() => {
@@ -500,7 +577,7 @@ export function buildApp({ db, origin, secureCookies = false, sendMail, teamEmai
   });
   app.get('/api/v1/admin/audit', async (request, reply) => {
     if (!auth(request, reply, 'admin')) return;
-    return { items: db.prepare('SELECT id,actor_id actorId,action,entity_type entityType,entity_id entityId,created_at createdAt FROM audit_log ORDER BY created_at DESC LIMIT 100').all() };
+    return { items: db.prepare('SELECT id,actor_id actorId,action,entity_type entityType,entity_id entityId,created_at createdAt FROM audit_log ORDER BY created_at DESC,rowid DESC LIMIT 100').all() };
   });
   app.get('/api/v1/admin/diagnostics', async (request, reply) => {
     if (!auth(request, reply, 'admin')) return;

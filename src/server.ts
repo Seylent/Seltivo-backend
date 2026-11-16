@@ -11,6 +11,9 @@ const smtp = process.env.SMTP_HOST && process.env.SMTP_USER && process.env.SMTP_
       host: process.env.SMTP_HOST,
       port: Number(process.env.SMTP_PORT ?? 587),
       secure: process.env.SMTP_PORT === '465',
+      connectionTimeout: 10_000,
+      greetingTimeout: 10_000,
+      socketTimeout: 15_000,
       auth: { user: process.env.SMTP_USER, pass: process.env.SMTP_PASSWORD },
     }) : null;
 const devMail = process.env.NODE_ENV !== 'production' && process.env.SELTIVO_DEV_MAIL === 'console';
@@ -19,6 +22,7 @@ const app = buildApp({
   origin,
   secureCookies: process.env.NODE_ENV === 'production',
   teamEmail: process.env.SELTIVO_TEAM_EMAIL,
+  databaseBytes: () => (db.pragma('page_count', { simple: true }) as number) * (db.pragma('page_size', { simple: true }) as number),
   sendMail: smtp ? async (to, subject, text) => { await smtp.sendMail({ from: process.env.SMTP_FROM, to, subject, text }); }
     : devMail ? async (to, subject, text) => { console.log(`DEV MAIL to ${to}: ${subject}\n${text}`); } : undefined,
 });

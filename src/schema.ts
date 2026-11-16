@@ -100,4 +100,11 @@ export const MIGRATIONS = [
     CREATE INDEX notifications_recipient ON notifications(recipient_id, created_at DESC);
     CREATE INDEX notifications_request ON notifications(request_id, recipient_id, read_at);
   ` },
+  { version: 4, sql: `
+    CREATE INDEX IF NOT EXISTS users_role_created ON users(role, created_at DESC, id DESC);
+    CREATE INDEX IF NOT EXISTS sessions_expires ON sessions(expires_at);
+    CREATE INDEX IF NOT EXISTS auth_tokens_expires ON auth_tokens(expires_at);
+    CREATE INDEX IF NOT EXISTS audit_actor ON audit_log(actor_id);
+    CREATE INDEX IF NOT EXISTS audit_entity ON audit_log(entity_type, entity_id);
+  ` },
 ] as const;

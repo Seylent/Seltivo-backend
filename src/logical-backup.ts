@@ -68,20 +68,47 @@ export async function createLogicalBackup(db: SeltivoDb, store: Store, at = new 
     format: 'seltivo-logical-v1', createdAt: at.toISOString(), schemaVersion: latestVersion,
     chunks: [], rowCounts: Object.fromEntries(tables.map((table) => [table, 0])) as Record<Table, number>,
   };
+  const maxChunkBytes = 16 * 1024 * 1024;
+  const targetChunkBytes = 8 * 1024 * 1024;
   let totalBytes = 0;
+  const flushChunk = async (table: Table, chunkIndex: number, rows: Row[]) => {
+    const data = JSON.stringify(rows);
+    const bytes = encoder.encode(data).byteLength;
+    if (bytes > maxChunkBytes) throw new Error(`Backup chunk too large: ${table}`);
+    const key = `${base}${table}/${String(chunkIndex).padStart(10, '0')}.json`;
+    await store.put(key, data);
+    manifest.chunks.push({ key, table, rows: rows.length, bytes, sha256: await sha256(data) });
+    manifest.rowCounts[table] += rows.length;
+    totalBytes += bytes;
+  };
   for (const table of tables) {
-    const limit = table === 'configurations' || table === 'requests' ? 1 : 100;
-    for (let offset = 0; ; offset += limit) {
-      const rows = rowsFor(db, table, limit, offset);
-      if (!rows.length) break;
-      const data = JSON.stringify(rows);
-      const bytes = encoder.encode(data).byteLength;
-      if (bytes > 16 * 1024 * 1024) throw new Error(`Backup chunk too large: ${table}`);
-      const key = `${base}${table}/${String(offset).padStart(10, '0')}.json`;
-      await store.put(key, data);
-      manifest.chunks.push({ key, table, rows: rows.length, bytes, sha256: await sha256(data) });
-      manifest.rowCounts[table] += rows.length;
-      totalBytes += bytes;
+    if (table === 'configurations' || table === 'requests') {
+      let chunkRows: Row[] = [];
+      let chunkBytes = 2;
+      let chunkStartOffset = 0;
+      for (let offset = 0; ; offset += 1) {
+        const rows = rowsFor(db, table, 1, offset);
+        if (!rows.length) break;
+        const row = rows[0];
+        const rowBytes = encoder.encode(JSON.stringify(row)).byteLength + 1;
+        if (rowBytes + 2 > maxChunkBytes) throw new Error(`Backup chunk too large: ${table}`);
+        if (chunkRows.length > 0 && (chunkBytes + rowBytes > targetChunkBytes || chunkRows.length >= 50)) {
+          await flushChunk(table, chunkStartOffset, chunkRows);
+          chunkRows = [];
+          chunkBytes = 2;
+          chunkStartOffset = offset;
+        }
+        chunkRows.push(row);
+        chunkBytes += rowBytes;
+      }
+      if (chunkRows.length > 0) await flushChunk(table, chunkStartOffset, chunkRows);
+    } else {
+      const limit = 100;
+      for (let offset = 0; ; offset += limit) {
+        const rows = rowsFor(db, table, limit, offset);
+        if (!rows.length) break;
+        await flushChunk(table, offset, rows);
+      }
     }
   }
   if (changes(db) !== startedAt) throw new Error('Database changed during backup; no manifest published');

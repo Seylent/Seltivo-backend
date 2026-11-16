@@ -16,7 +16,7 @@ npm run dev
 
 Сервер слухає `127.0.0.1:4000`. У production проксі має направляти `/api/v1/*` на бекенд під тим самим origin, що й Next. Бекенд не виставляйте напряму в інтернет. Для довіреного локального проксі можна встановити `SELTIVO_TRUST_PROXY=1`, щоб ліміти враховували IP клієнта із forwarded headers. На проксі також потрібні TLS, обмеження тіла запиту й rate limit.
 
-Node база за замовчуванням: `./data/seltivo.db`; для Node-інсталяції задайте `SELTIVO_DB_PATH` на постійному **локальному** томі. Схема v2 застосовується послідовними SQL-міграціями; стара заповнена БД без `user_version` оновлюється зі збереженням даних. `foreign_keys` і WAL увімкнені. Node-копія: `npm run backup -- D:\backups\seltivo-20261114T010000Z.db`; перевірка файлу: `npm run backup:verify -- D:\staging\restored.db`. [Процедура Node-резервування](docs/backup-recovery.md) не застосовується до Worker. Worker веде версії в `schema_migrations`; його відновлення описане окремо в [Cloudflare operations](docs/cloudflare-operations.md).
+Node база за замовчуванням: `./data/seltivo.db`; для Node-інсталяції задайте `SELTIVO_DB_PATH` на постійному **локальному** томі. Схема v3 застосовується послідовними SQL-міграціями; стара заповнена БД без `user_version` оновлюється зі збереженням даних. `foreign_keys` і WAL увімкнені. Node-копія: `npm run backup -- D:\backups\seltivo-20261114T010000Z.db`; перевірка файлу: `npm run backup:verify -- D:\staging\restored.db`. [Процедура Node-резервування](docs/backup-recovery.md) не застосовується до Worker. Worker веде версії в `schema_migrations`; його відновлення описане окремо в [Cloudflare operations](docs/cloudflare-operations.md).
 
 Для Node-пошти заповніть `SMTP_HOST`, `SMTP_PORT`, `SMTP_USER`, `SMTP_PASSWORD`, `SMTP_FROM`. Реєстрація зараз працює без SMTP, але відновлення пароля без пошти неможливе. `SELTIVO_TEAM_EMAIL` отримує сповіщення про повідомлення клієнтів. Збій пошти не скасовує вже збережене повідомлення; адміністратор бачить недоставлені листи в API та адмінці й може повторити доставку.
 
@@ -41,12 +41,12 @@ Remove-Item Env:SELTIVO_ADMIN_PASSWORD
 | --- | --- |
 | Health | `GET /health` |
 | Реєстрація, верифікація, вхід, вихід | `POST /auth/register`, `/auth/resend-verification`, `/auth/verify-email`, `/auth/login`, `/auth/logout` |
-| Відновлення пароля | `POST /auth/forgot-password`, `/auth/reset-password` |
+| Відновлення та зміна пароля | `POST /auth/forgot-password`, `/auth/reset-password`, `/auth/change-password` |
 | Профіль | `GET/PATCH/DELETE /me` |
 | Збережені конфігурації | `GET/POST /configurations`, `GET/PATCH/DELETE /configurations/:id` |
 | Заявки | `GET/POST /requests`, `GET /requests/:id` |
-| Чат | `GET/POST /requests/:id/messages`, `PATCH /requests/:id/read`, `GET /notifications/unread-count` |
-| Адміністратор | `GET /admin/customers`, `GET /admin/requests`, `PATCH /admin/requests/:id/status`, `GET /admin/email-notifications`, `POST /admin/email-notifications/:id/retry`, `GET /admin/diagnostics`, `GET /admin/audit` |
+| Чат та сповіщення | `GET/POST /requests/:id/messages`, `PATCH /requests/:id/read`, `GET /notifications/unread-count`, `GET /notifications`, `PATCH /notifications/requests/:id/read` |
+| Адміністратор | `GET /admin/customers`, `GET /admin/customers/:id`, `GET /admin/requests`, `PATCH /admin/requests/:id/status`, `POST /admin/requests/:id/reopen`, `GET /admin/email-notifications`, `POST /admin/email-notifications/:id/retry`, `GET /admin/diagnostics`, `GET /admin/audit` |
 
 Створення заявки вимагає `clientSubmissionId` (UUID); повідомлення — `clientMessageId` (UUID). Повторіть той самий ID і ті самі дані після timeout: сервер поверне попередній результат. Для оновлення конфігурації та статусу потрібен `If-Match` із поточною версією. Чужі заявки й конфігурації повертають 404.
 
@@ -54,7 +54,7 @@ Remove-Item Env:SELTIVO_ADMIN_PASSWORD
 
 `DELETE /configurations/:id` приховує збережений варіант, але не стирає знімок у вже створених заявках. `DELETE /me` видаляє клієнтський акаунт разом із заявками й чатом після перевірки пароля. У Worker окремий Durable Object зберігає журнал ID видалень і повторно застосовує їх після PITR. Функція вимкнена за замовчуванням до пробного restore на staging; порядок увімкнення — у [Cloudflare operations](docs/cloudflare-operations.md). Строк даних у вже створених копіях — до 30 днів.
 
-Worker підготовлено до щоденної логічної копії в R2 о 02:00 UTC. Приватний bucket і 30-денне правило зберігання налаштовані; staging restore ще не перевірено, тому production-критерій резервування не виконано. Команди перевірки — у [Cloudflare operations](docs/cloudflare-operations.md).
+Worker підготовлено до щоденної логічної копії в R2 о 02:00 UTC та погодинного очищення копій, старших за 30 днів. Приватний bucket, 30-денне правило зберігання й пробне відновлення на окремому staging Worker перевірені; деталі та команди повторної перевірки — у [Cloudflare operations](docs/cloudflare-operations.md).
 
 ## Перевірки
 

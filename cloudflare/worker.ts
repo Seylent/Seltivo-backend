@@ -4,11 +4,10 @@ import { buildApp } from '../src/app.js';
 import { openCloudflareDatabase } from '../src/cloudflare-db.js';
 import { createWorkerRouter } from './worker-router.js';
 import { purgeCustomer } from '../src/delete-account.js';
-import { createLogicalBackup } from '../src/logical-backup.js';
+import { createLogicalBackup, restoreLogicalBackup } from '../src/logical-backup.js';
 import { pruneExpiredBackups } from '../src/backup-retention.js';
-import { restoreLogicalBackup } from '../src/logical-backup.js';
 import { runStagingRestoreCheck } from './staging-restore.js';
-import { hashPassword, now } from '../src/auth.js';
+import { hashPassword, isValidPasswordHash, normalizeEmail, now } from '../src/auth.js';
 import type { SeltivoDb } from '../src/db.js';
 export { DeletionLedger } from './deletion-ledger.js';
 
@@ -73,10 +72,13 @@ export class SeltivoData extends DurableObject<Env> {
       for (const id of ids) purgeCustomer(db, id);
     });
     if (env.SELTIVO_ADMIN_PASSWORD_HASH && !this.restoreProbe) {
+      if (!isValidPasswordHash(env.SELTIVO_ADMIN_PASSWORD_HASH)) {
+        throw new Error('SELTIVO_ADMIN_PASSWORD_HASH must be a valid scrypt password hash');
+      }
       const timestamp = new Date().toISOString();
       db.prepare(`INSERT OR IGNORE INTO users(id,email,password_hash,role,name,email_verified_at,created_at,updated_at)
         VALUES (?,?,?,'admin','Seltivo Studio',?,?,?)`)
-        .run(randomUUID(), env.SELTIVO_ADMIN_EMAIL, env.SELTIVO_ADMIN_PASSWORD_HASH, timestamp, timestamp, timestamp);
+        .run(randomUUID(), normalizeEmail(env.SELTIVO_ADMIN_EMAIL), env.SELTIVO_ADMIN_PASSWORD_HASH, timestamp, timestamp, timestamp);
     }
     this.app = buildApp({
       db,
@@ -133,7 +135,7 @@ export class SeltivoData extends DurableObject<Env> {
         || typeof body.password !== 'string' || body.password.length < 12 || body.password.length > 200) return new Response(null, { status: 422 });
       const timestamp = now();
       this.db.prepare("INSERT INTO users(id,email,password_hash,role,name,email_verified_at,created_at,updated_at) VALUES (?,?,?,'admin','Staging Admin',?,?,?)")
-        .run(randomUUID(), body.email, await hashPassword(body.password), timestamp, timestamp, timestamp);
+        .run(randomUUID(), normalizeEmail(body.email), await hashPassword(body.password), timestamp, timestamp, timestamp);
       return new Response(null, { status: 201 });
     }
     if (url.pathname === '/internal/backup' && request.method === 'POST') {
@@ -149,14 +151,16 @@ export class SeltivoData extends DurableObject<Env> {
       }
     }
     const declaredLength = Number(request.headers.get('content-length') ?? 0);
-    if (declaredLength > 9 * 1024 * 1024) return Response.json({ error: 'Запит завеликий.' }, { status: 413 });
+    if (!Number.isFinite(declaredLength) || declaredLength < 0 || declaredLength > 9 * 1024 * 1024) {
+      return Response.json({ error: 'Запит завеликий.' }, { status: 413 });
+    }
     const body = request.method === 'GET' || request.method === 'HEAD'
       ? undefined : Buffer.from(await request.arrayBuffer());
     if (body && body.length > 9 * 1024 * 1024) return Response.json({ error: 'Запит завеликий.' }, { status: 413 });
     const result = await this.app.inject({
       method: request.method as 'GET',
       url: url.pathname + url.search,
-      headers: Object.fromEntries(request.headers),
+      headers: Object.fromEntries(request.headers.entries()),
       payload: body,
     });
     const headers = new Headers();
@@ -166,7 +170,7 @@ export class SeltivoData extends DurableObject<Env> {
     headers.set('X-Request-Id', requestId);
     console.log(JSON.stringify({ event: 'api_request', requestId, method: request.method,
       status: result.statusCode, durationMs: Date.now() - started, databaseBytes: this.ctx.storage.sql.databaseSize }));
-    return new Response(result.statusCode === 204 ? null : result.rawPayload, { status: result.statusCode, headers });
+    return new Response(result.statusCode === 204 ? null : new Uint8Array(result.rawPayload), { status: result.statusCode, headers });
   }
 
   async alarm(): Promise<void> {

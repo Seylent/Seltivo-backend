@@ -42,19 +42,24 @@ export function createWorkerRouter(): FastifyInstance {
       if (!route) reply.code(404).send({ error: 'Не знайдено.' });
       else {
         const match = route.pattern.exec(url.pathname)!;
-        const params = Object.fromEntries(route.names.map((name, i) => [name, decodeURIComponent(match[i + 1])]));
+        const headers = Object.fromEntries(Object.entries(input.headers ?? {}).map(([key, value]) => [key.toLowerCase(), value]));
         const request = {
           method: input.method,
           url: input.url,
-          headers: input.headers ?? {},
-          ip: input.headers?.['cf-connecting-ip'] ?? '127.0.0.1',
-          params,
+          headers,
+          ip: headers['cf-connecting-ip'] ?? '127.0.0.1',
+          params: {} as Record<string, string>,
           query: Object.fromEntries(url.searchParams),
           body: undefined as unknown,
         };
         try {
-          if ((input.payload?.length ?? 0) > 9 * 1024 * 1024) reply.code(413).send({ error: 'Запит завеликий.' });
-          else if (input.payload?.length) {
+          try {
+            request.params = Object.fromEntries(route.names.map((name, i) => [name, decodeURIComponent(match[i + 1])]));
+          } catch {
+            reply.code(400).send({ error: 'Невірний формат запиту.' });
+          }
+          if (!reply.sent && (input.payload?.length ?? 0) > 9 * 1024 * 1024) reply.code(413).send({ error: 'Запит завеликий.' });
+          else if (!reply.sent && input.payload?.length) {
             try { request.body = JSON.parse(input.payload.toString('utf8')); }
             catch { reply.code(400).send({ error: 'Невірний формат запиту.' }); }
           }
@@ -66,12 +71,12 @@ export function createWorkerRouter(): FastifyInstance {
             const result = await route.handler(request, reply);
             if (!reply.sent) reply.send(result);
           }
-          for (const hook of hooks.onSend) await hook(request, reply);
         } catch (error) {
           if (errorHandler) await errorHandler(error, request, reply);
           else throw error;
         }
       }
+      for (const hook of hooks.onSend) await hook({ method: input.method, url: input.url, headers: {} }, reply);
       const payload = reply.statusCode === 204 || reply.payload === undefined ? Buffer.alloc(0)
         : Buffer.from(typeof reply.payload === 'string' ? reply.payload : JSON.stringify(reply.payload));
       if (reply.payload !== undefined && typeof reply.payload !== 'string') reply.header('Content-Type', 'application/json; charset=utf-8');

@@ -35,7 +35,12 @@ function migrate(storage: Storage): void {
     const legacy = current === 0 && sql.exec("SELECT name FROM sqlite_master WHERE type='table' AND name='users'").toArray().length > 0;
     for (const migration of MIGRATIONS) {
       if (migration.version <= current) continue;
-      sql.exec(migration.sql);
+      if (migration.sql.includes('CREATE TABLE')) sql.exec(migration.sql);
+      else {
+        for (const statement of migration.sql.split(';').map((part) => part.trim()).filter(Boolean)) {
+          sql.exec(statement);
+        }
+      }
       if (migration.version === 1 && legacy) checkLegacySchema(sql);
       if (sql.exec('PRAGMA foreign_key_check').toArray().length) throw new Error(`Foreign key violations after migration ${migration.version}`);
       sql.exec('INSERT INTO schema_migrations(version,applied_at) VALUES (?,?)', migration.version, new Date().toISOString());

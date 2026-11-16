@@ -5,7 +5,7 @@ Production використовує SQLite-backed Durable Object `SeltivoData` �
 ## Схема та реліз
 
 - Код зберігає версію Worker БД у таблиці `schema_migrations`. `PRAGMA user_version` у Cloudflare Durable Object не підтримується. Міграції застосовуються послідовно в одній синхронній транзакції перед обробкою запитів. Невідома новіша версія або несумісна стара схема зупиняє об'єкт.
-- Перед релізом, що змінює схему, зафіксуйте час, поточну версію коду, поточний [PITR bookmark](https://developers.cloudflare.com/durable-objects/api/sqlite-storage-api/#pitr-point-in-time-recovery-api) і результат `GET /api/v1/admin/diagnostics` операторським акаунтом. Нову версію спочатку перевірте на окремому staging об'єкті зі знеособленими даними. Staging зараз відсутній, тому цей release gate ще не виконаний.
+- Перед релізом, що змінює схему, зафіксуйте час, поточну версію коду, поточний [PITR bookmark](https://developers.cloudflare.com/durable-objects/api/sqlite-storage-api/#pitr-point-in-time-recovery-api) і результат `GET /api/v1/admin/diagnostics` операторським акаунтом. Нову версію спочатку перевірте на окремому staging об'єкті (`--env staging`) зі знеособленими даними.
 - Після релізу перевірте `GET /api/v1/health`, адміністраторську діагностику, вхід, заявку, діалог і повтор клієнтського запиту. Для відкату коду з версією схеми, новішою за код, потрібна сумісна версія Worker; старий код навмисно відмовиться відкрити БД.
 
 ## Відновлення й видалення

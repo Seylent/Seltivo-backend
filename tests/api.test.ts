@@ -92,6 +92,18 @@ test('registration, ownership, idempotent requests, chat and admin status', asyn
     assert.equal((await call('PATCH', `/api/v1/admin/requests/${first.body.id}/status`, { status: 'in_progress' }, admin2, { 'if-match': '1' })).status, 409);
     assert.equal((await call('PATCH', `/api/v1/admin/requests/${first.body.id}/status`, { status: 'in_progress' }, admin2, { 'if-match': '2' })).status, 200);
     assert.equal((await call('GET', `/api/v1/requests/${first.body.id}`, undefined, alice)).body.events.length, 3);
+    assert.equal((await call('PATCH', `/api/v1/admin/requests/${first.body.id}/status`, { status: 'completed', reason: 'Готово' }, admin, { 'if-match': '3' })).status, 200);
+    assert.equal((await call('POST', `/api/v1/requests/${first.body.id}/messages`, { body: 'Ще питання', clientMessageId: randomUUID() }, alice)).status, 409);
+    assert.equal((await call('POST', `/api/v1/admin/requests/${first.body.id}/reopen`, { reason: 'Додаткові правки' }, admin, { 'if-match': '3' })).status, 409);
+    const reopened = await call('POST', `/api/v1/admin/requests/${first.body.id}/reopen`, { reason: 'Додаткові правки' }, admin, { 'if-match': '4' });
+    assert.equal(reopened.status, 200);
+    assert.equal(reopened.body.status, 'reviewing');
+    assert.equal(reopened.body.statusVersion, 5);
+    assert.equal((await call('GET', `/api/v1/requests/${first.body.id}`, undefined, alice)).body.events.length, 5);
+    assert.equal((await call('GET', '/api/v1/notifications', undefined, alice)).body.unread, 3);
+    const auditLog = await call('GET', '/api/v1/admin/audit', undefined, admin);
+    assert.equal(auditLog.status, 200);
+    assert.ok(auditLog.body.items.some((item: { action: string }) => item.action === 'request.reopen'));
     assert.equal((await call('GET', '/api/v1/admin/customers', undefined, alice)).status, 403);
     const invalid = await app.inject({ method: 'POST', url: '/api/v1/auth/login', headers: { origin, 'content-type': 'application/json' }, payload: '{' });
     assert.equal(invalid.statusCode, 400);
@@ -142,5 +154,53 @@ test('failed chat email is visible to admins and retry does not create another m
     assert.equal(sends, 2);
     assert.equal((await call('GET', '/api/v1/admin/email-notifications', undefined, admin)).body.items.length, 0);
     assert.equal((await call('GET', url, undefined, customer)).body.items.length, 1);
+  } finally { await app.close(); db.close(); }
+});
+
+test('profile update, password change, password reset and email verification flows work end-to-end', async () => {
+  const db = openDatabase(':memory:');
+  const sent: { to: string; subject: string; text: string }[] = [];
+  const app = buildApp({ db, origin, logger: false, sendMail: async (to, subject, text) => { sent.push({ to, subject, text }); } });
+  const call = async (method: string, url: string, payload?: unknown, cookie?: string) => {
+    const response = await app.inject({ method: method as 'GET', url, headers: { origin, ...(cookie ? { cookie } : {}) }, payload } as any);
+    return { status: response.statusCode, body: response.body ? JSON.parse(response.body) : null, cookie: response.headers['set-cookie'] as string | undefined };
+  };
+  try {
+    const reg = await call('POST', '/api/v1/auth/register', { email: 'Flow@Example.test', password: 'InitialPassword123!', name: 'Flow User' });
+    assert.equal(reg.status, 201);
+    const login = await call('POST', '/api/v1/auth/login', { email: 'flow@example.test', password: 'InitialPassword123!' });
+    assert.equal(login.status, 200);
+    const cookie = login.cookie!.split(';')[0];
+
+    assert.equal((await call('PATCH', '/api/v1/me', { name: 'Updated Name', phone: '+380501112233', telegram: '@flow_user' }, cookie)).status, 200);
+    const profile = await call('GET', '/api/v1/me', undefined, cookie);
+    assert.equal(profile.body.name, 'Updated Name');
+    assert.equal(profile.body.phone, '+380501112233');
+    assert.equal(profile.body.telegram, '@flow_user');
+
+    assert.equal((await call('POST', '/api/v1/auth/forgot-password', { email: 'flow@example.test' })).status, 202);
+    assert.equal(sent.length, 1);
+    const staleResetToken = new URL(sent[0].text.split(': ').pop()!).searchParams.get('token')!;
+
+    assert.equal((await call('POST', '/api/v1/auth/change-password', { currentPassword: 'wrong', newPassword: 'ChangedPassword123!' }, cookie)).status, 401);
+    assert.equal((await call('POST', '/api/v1/auth/change-password', { currentPassword: 'InitialPassword123!', newPassword: 'InitialPassword123!' }, cookie)).status, 422);
+    assert.equal((await call('POST', '/api/v1/auth/change-password', { currentPassword: 'InitialPassword123!', newPassword: 'ChangedPassword123!' }, cookie)).status, 200);
+    assert.equal((await call('GET', '/api/v1/me', undefined, cookie)).status, 401);
+    assert.equal((await call('POST', '/api/v1/auth/reset-password', { token: staleResetToken, password: 'AnotherPassword123!' })).status, 422);
+
+    assert.equal((await call('POST', '/api/v1/auth/forgot-password', { email: 'flow@example.test' })).status, 202);
+    assert.equal(sent.length, 2);
+    const resetToken = new URL(sent[1].text.split(': ').pop()!).searchParams.get('token')!;
+    assert.equal((await call('POST', '/api/v1/auth/reset-password', { token: resetToken, password: 'ResetPassword123!' })).status, 200);
+    assert.equal((await call('POST', '/api/v1/auth/reset-password', { token: resetToken, password: 'ResetPassword123!' })).status, 422);
+    assert.equal((await call('POST', '/api/v1/auth/login', { email: 'flow@example.test', password: 'ChangedPassword123!' })).status, 401);
+    assert.equal((await call('POST', '/api/v1/auth/login', { email: 'flow@example.test', password: 'ResetPassword123!' })).status, 200);
+
+    db.prepare('UPDATE users SET email_verified_at=NULL WHERE id=?').run(reg.body.id);
+    assert.equal((await call('POST', '/api/v1/auth/resend-verification', { email: 'flow@example.test' })).status, 202);
+    assert.equal(sent.length, 3);
+    const verifyToken = new URL(sent[2].text.split(': ').pop()!).searchParams.get('token')!;
+    assert.equal((await call('POST', '/api/v1/auth/verify-email', { token: verifyToken })).status, 200);
+    assert.equal((await call('POST', '/api/v1/auth/verify-email', { token: verifyToken })).status, 422);
   } finally { await app.close(); db.close(); }
 });

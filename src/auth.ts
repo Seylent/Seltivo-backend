@@ -6,9 +6,16 @@ import type { SeltivoDb } from './db.js';
 const scrypt = promisify(scryptCallback);
 const SHORT_SESSION_MS = 12 * 60 * 60 * 1000;
 const REMEMBER_SESSION_MS = 30 * 24 * 60 * 60 * 1000;
+const MAX_SESSIONS_PER_USER = 10;
+const DUMMY_PASSWORD_HASH = `scrypt:${'0'.repeat(32)}:${'0'.repeat(128)}`;
 export const now = () => new Date().toISOString();
 export const hashToken = (token: string) => createHash('sha256').update(token).digest('hex');
 export const normalizeEmail = (email: string) => email.trim().toLowerCase();
+
+export function isValidPasswordHash(stored: string) {
+  const [algorithm, salt, hex, ...rest] = stored.split(':');
+  return rest.length === 0 && algorithm === 'scrypt' && /^[a-f0-9]{32}$/.test(salt ?? '') && /^[a-f0-9]{128}$/.test(hex ?? '');
+}
 
 export async function hashPassword(password: string) {
   const salt = randomBytes(16).toString('hex');
@@ -16,17 +23,23 @@ export async function hashPassword(password: string) {
   return `scrypt:${salt}:${hash.toString('hex')}`;
 }
 
-export async function verifyPassword(password: string, stored: string) {
-  const [algorithm, salt, hex] = stored.split(':');
-  if (algorithm !== 'scrypt' || !/^[a-f0-9]{32}$/.test(salt ?? '') || !/^[a-f0-9]{128}$/.test(hex ?? '')) return false;
+export async function verifyPassword(password: string, stored?: string | null) {
+  const target = stored && isValidPasswordHash(stored) ? stored : DUMMY_PASSWORD_HASH;
+  const [, salt, hex] = target.split(':');
   const actual = await scrypt(password, salt, 64) as Buffer;
-  return timingSafeEqual(actual, Buffer.from(hex, 'hex'));
+  const matched = timingSafeEqual(actual, Buffer.from(hex, 'hex'));
+  return Boolean(stored && isValidPasswordHash(stored)) && matched;
 }
 
 export function createSession(db: SeltivoDb, userId: string, rememberMe = false) {
+  const timestamp = now();
+  db.prepare('DELETE FROM sessions WHERE expires_at<=?').run(timestamp);
+  db.prepare(`DELETE FROM sessions WHERE user_id=? AND token_hash NOT IN (
+    SELECT token_hash FROM sessions WHERE user_id=? ORDER BY created_at DESC, token_hash DESC LIMIT ?
+  )`).run(userId, userId, MAX_SESSIONS_PER_USER - 1);
   const token = randomBytes(32).toString('base64url');
   db.prepare('INSERT INTO sessions(token_hash,user_id,expires_at,created_at) VALUES (?,?,?,?)')
-    .run(hashToken(token), userId, new Date(Date.now() + (rememberMe ? REMEMBER_SESSION_MS : SHORT_SESSION_MS)).toISOString(), now());
+    .run(hashToken(token), userId, new Date(Date.now() + (rememberMe ? REMEMBER_SESSION_MS : SHORT_SESSION_MS)).toISOString(), timestamp);
   return token;
 }
 
@@ -55,10 +68,11 @@ export function actorFromRequest(db: SeltivoDb, request: FastifyRequest): Actor 
 }
 
 export function newAuthToken(db: SeltivoDb, userId: string, purpose: 'verify' | 'reset', ttlMs: number) {
-  db.prepare('DELETE FROM auth_tokens WHERE user_id=? AND purpose=?').run(userId, purpose);
+  const timestamp = now();
+  db.prepare('DELETE FROM auth_tokens WHERE (user_id=? AND purpose=?) OR expires_at<=?').run(userId, purpose, timestamp);
   const token = randomBytes(32).toString('base64url');
   db.prepare('INSERT INTO auth_tokens(token_hash,user_id,purpose,expires_at,created_at) VALUES (?,?,?,?,?)')
-    .run(hashToken(token), userId, purpose, new Date(Date.now() + ttlMs).toISOString(), now());
+    .run(hashToken(token), userId, purpose, new Date(Date.now() + ttlMs).toISOString(), timestamp);
   return token;
 }
 

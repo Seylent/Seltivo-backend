@@ -1,13 +1,14 @@
 {
   "compilerOptions": {
     "target": "ES2022",
+    "lib": ["ES2022"],
     "module": "NodeNext",
     "moduleResolution": "NodeNext",
     "strict": true,
     "esModuleInterop": true,
     "skipLibCheck": true,
     "noEmit": true,
-    "types": ["node"]
+    "types": ["node", "@cloudflare/workers-types"]
   },
-  "include": ["src/**/*.ts", "tests/**/*.ts"]
+  "include": ["src/**/*.ts", "cloudflare/**/*.ts", "tests/**/*.ts"]
 }

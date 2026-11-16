@@ -32,6 +32,7 @@ function seedUser(db: ReturnType<typeof database>, email: string) {
 
 function cloudflareDatabase() {
   const sqlite = new Database(':memory:');
+  sqlite.pragma('foreign_keys = ON');
   const storage = {
     sql: { exec(query: string, ...values: (string | number | null)[]) {
       if (!values.length && query.includes('CREATE TABLE')) { sqlite.exec(query); return { toArray: () => [] }; }
