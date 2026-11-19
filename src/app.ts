@@ -8,7 +8,7 @@ const id = z.uuid();
 const email = z.email().max(254);
 const password = z.string().min(12).max(200);
 const contact = z.object({ name: z.string().trim().min(2).max(60), email: email.optional(), phone: z.string().trim().max(40).optional(), telegram: z.string().trim().max(80).optional() }).strict();
-const feature = z.enum(['telegram-orders', 'online-payment', 'admin-panel', 'delivery', 'other']);
+const feature = z.enum(['telegram-orders', 'online-payment', 'admin-panel', 'personal-account', 'delivery', 'booking', 'blog', 'search', 'analytics', 'chat', 'other']);
 const page = z.object({ offset: z.coerce.number().int().nonnegative().default(0), limit: z.coerce.number().int().min(1).max(100).default(50) });
 const statuses = ['submitted', 'reviewing', 'needs_info', 'in_progress', 'completed', 'cancelled'] as const;
 type Status = typeof statuses[number];
@@ -427,6 +427,19 @@ export function buildApp({ db, origin, secureCookies = false, requireEmailVerifi
     const row = requestRow((request.params as any).id, actor); if (!row) return fail(reply, 404, 'Не знайдено.');
     const events = db.prepare('SELECT old_status oldStatus,new_status newStatus,reason,created_at createdAt FROM request_events WHERE request_id=? ORDER BY created_at,rowid').all(row.id);
     return { id: row.id, customerId: row.customer_id, templateId: row.template_id, templateName: row.template_name, status: row.status, statusVersion: row.status_version, configuration: row.config_snapshot_json ? JSON.parse(row.config_snapshot_json) : null, contact: JSON.parse(row.contact_json), note: row.note, features: JSON.parse(row.features_json), conversationId: row.conversation_id, events, createdAt: row.created_at };
+  });
+  app.delete('/api/v1/requests/:id', async (request, reply) => {
+    const actor = auth(request, reply, 'customer'); if (!actor || !verified(actor, reply)) return;
+    const requestId = (request.params as any).id;
+    const row = db.prepare('SELECT id FROM requests WHERE id=? AND customer_id=?').get(requestId, actor.id);
+    if (!row) return fail(reply, 404, 'Не знайдено.');
+    db.transaction(() => {
+      db.prepare('DELETE FROM requests WHERE id=? AND customer_id=?').run(requestId, actor.id);
+      db.prepare('INSERT INTO audit_log(id,actor_id,action,entity_type,entity_id,created_at) VALUES (?,?,?,?,?,?)')
+        .run(randomUUID(), actor.id, 'request.delete', 'request', requestId, now());
+    })();
+    unreadCache.delete(actor.id);
+    return reply.code(204).send();
   });
   app.get('/api/v1/requests/:id/messages', async (request, reply) => {
     const actor = auth(request, reply); if (!actor) return;

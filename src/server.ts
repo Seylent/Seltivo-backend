@@ -1,6 +1,7 @@
 import nodemailer from 'nodemailer';
 import { openDatabase } from './db.js';
 import { buildApp } from './app.js';
+import { purgeCustomer } from './delete-account.js';
 
 const origin = process.env.SELTIVO_PUBLIC_ORIGIN;
 if (!origin) throw new Error('SELTIVO_PUBLIC_ORIGIN is required');
@@ -23,6 +24,7 @@ const app = buildApp({
   secureCookies: process.env.NODE_ENV === 'production',
   teamEmail: process.env.SELTIVO_TEAM_EMAIL,
   databaseBytes: () => (db.pragma('page_count', { simple: true }) as number) * (db.pragma('page_size', { simple: true }) as number),
+  deleteCustomer: async (userId) => purgeCustomer(db, userId),
   sendMail: smtp ? async (to, subject, text) => { await smtp.sendMail({ from: process.env.SMTP_FROM, to, subject, text }); }
     : devMail ? async (to, subject, text) => { console.log(`DEV MAIL to ${to}: ${subject}\n${text}`); } : undefined,
 });
