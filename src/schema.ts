@@ -115,4 +115,20 @@ export const MIGRATIONS = [
       recovery_codes TEXT NOT NULL
     );
   ` },
+  { version: 6, sql: `
+    CREATE TABLE guest_requests (
+      id TEXT PRIMARY KEY,
+      name TEXT NOT NULL,
+      contact TEXT NOT NULL,
+      features_json TEXT NOT NULL,
+      budget TEXT NOT NULL,
+      note TEXT NOT NULL,
+      template_name TEXT,
+      telegram_status TEXT NOT NULL CHECK(telegram_status IN ('sent','failed')),
+      status TEXT NOT NULL DEFAULT 'new' CHECK(status IN ('new','in_progress','done')),
+      created_at TEXT NOT NULL,
+      processed_at TEXT
+    );
+    CREATE INDEX guest_requests_created ON guest_requests(created_at DESC, id DESC);
+  ` },
 ] as const;

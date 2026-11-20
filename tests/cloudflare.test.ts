@@ -77,7 +77,7 @@ test('Cloudflare upgrades an occupied legacy object once and rejects a future sc
   try {
     openCloudflareDatabase(storage);
     assert.equal((sqlite.prepare('SELECT COUNT(*) AS count FROM users').get() as { count: number }).count, 1);
-    assert.deepEqual(sqlite.prepare('SELECT version FROM schema_migrations ORDER BY version').all(), [{ version: 1 }, { version: 2 }, { version: 3 }, { version: 4 }, { version: 5 }]);
+    assert.deepEqual(sqlite.prepare('SELECT version FROM schema_migrations ORDER BY version').all(), [{ version: 1 }, { version: 2 }, { version: 3 }, { version: 4 }, { version: 5 }, { version: 6 }]);
     const schemaVersion = sqlite.pragma('schema_version', { simple: true });
     openCloudflareDatabase(storage);
     assert.equal(sqlite.pragma('schema_version', { simple: true }), schemaVersion);

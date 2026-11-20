@@ -9,6 +9,20 @@ const id = z.uuid();
 const email = z.email().max(254);
 const password = z.string().min(12).max(200);
 const contact = z.object({ name: z.string().trim().min(2).max(60), email: email.optional(), phone: z.string().trim().max(40).optional(), telegram: z.string().trim().max(80).optional() }).strict();
+const guestRequest = z.object({
+  id,
+  name: z.string().trim().min(2).max(60),
+  contact: z.string().trim().min(3).max(80),
+  features: z.array(z.string().trim().min(1).max(60)).max(5),
+  budget: z.string().trim().max(60),
+  note: z.string().trim().max(1800),
+  templateName: z.string().trim().max(120).optional(),
+  telegramStatus: z.enum(['sent', 'failed']),
+}).strict().refine((data) => data.features.length > 0 || data.note.length > 0, {
+  message: 'Додайте хоча б одну функцію або опишіть задачу.',
+  path: ['note'],
+});
+const guestStatuses = ['new', 'in_progress', 'done'] as const;
 // Користувач може додати власну функцію прямо у формі (TagInput), тож жорсткий
 // enum тут відсікав би валідні заявки з 422 «Перевірте поля запиту».
 const feature = z.string().trim().min(1).max(80);
@@ -114,6 +128,7 @@ export function buildApp({ db, origin, secureCookies = false, requireEmailVerifi
         return { bucket: `POST:${path}`, windowMs: 15 * 60_000, max: 5 };
       }
       if (path.startsWith('/api/v1/auth/')) return { bucket: `POST:${path}`, windowMs: 60_000, max: 10 };
+      if (path === '/api/v1/guest-requests') return { bucket: 'POST:/api/v1/guest-requests', windowMs: 15 * 60_000, max: 20 };
       if (path === '/api/v1/requests') return { bucket: 'POST:/api/v1/requests', windowMs: 10 * 60_000, max: 5 };
       if (path === '/api/v1/configurations') return { bucket: 'WRITE:/api/v1/configurations', windowMs: 10 * 60_000, max: 20 };
       if (/^\/api\/v1\/requests\/[^/]+\/messages$/.test(path) || path.includes('/messages')) {
@@ -286,6 +301,17 @@ export function buildApp({ db, origin, secureCookies = false, requireEmailVerifi
       db.prepare('DELETE FROM auth_tokens WHERE token_hash=?').run(hashToken(body.token));
     })();
     return { ok: true };
+  });
+  // Гостьові заявки з публічних форм: зберігаємо копію для адмінки.
+  // Telegram-доставку виконує Next-route; сюди приходить уже знаний результат.
+  app.post('/api/v1/guest-requests', async (request, reply) => {
+    const body = parse(guestRequest, request.body, reply); if (!body) return;
+    const stored = db.prepare(`INSERT OR IGNORE INTO guest_requests
+      (id,name,contact,features_json,budget,note,template_name,telegram_status,status,created_at)
+      VALUES (?,?,?,?,?,?,?,?,'new',?)`)
+      .run(body.id, body.name, body.contact, JSON.stringify(body.features), body.budget, body.note,
+        body.templateName ?? null, body.telegramStatus, now());
+    return reply.code(stored.changes ? 201 : 200).send({ id: body.id });
   });
   app.post('/api/v1/auth/login', async (request, reply) => {
     const body = parse(z.object({ email, password: z.string().max(200), rememberMe: z.boolean().optional(), code: z.string().trim().max(32).optional() }).strict(), request.body, reply);
@@ -728,6 +754,32 @@ export function buildApp({ db, origin, secureCookies = false, requireEmailVerifi
   app.get('/api/v1/admin/audit', async (request, reply) => {
     if (!auth(request, reply, 'admin')) return;
     return { items: db.prepare('SELECT id,actor_id actorId,action,entity_type entityType,entity_id entityId,created_at createdAt FROM audit_log ORDER BY created_at DESC,rowid DESC LIMIT 100').all() };
+  });
+  app.get('/api/v1/admin/guest-requests', async (request, reply) => {
+    if (!auth(request, reply, 'admin')) return;
+    const query = parse(page, request.query, reply); if (!query) return;
+    type GuestRow = { id: string; name: string; contact: string; features_json: string; budget: string; note: string; template_name: string | null; telegram_status: string; status: string; created_at: string; processed_at: string | null };
+    const rows = db.prepare(`SELECT id,name,contact,features_json,budget,note,template_name,telegram_status,status,created_at,processed_at
+      FROM guest_requests ORDER BY created_at DESC,id DESC LIMIT ? OFFSET ?`).all(query.limit, query.offset) as GuestRow[];
+    const items = rows.map(({ features_json, template_name, telegram_status, created_at, processed_at, ...row }) => ({
+      ...row,
+      features: JSON.parse(features_json) as string[],
+      templateName: template_name,
+      telegramStatus: telegram_status,
+      createdAt: created_at,
+      processedAt: processed_at,
+    }));
+    return { items, nextOffset: items.length === query.limit ? query.offset + query.limit : null };
+  });
+  app.patch('/api/v1/admin/guest-requests/:id/status', async (request, reply) => {
+    const actor = auth(request, reply, 'admin'); if (!actor) return;
+    const guestId = (request.params as { id: string }).id;
+    const body = parse(z.object({ status: z.enum(guestStatuses) }).strict(), request.body, reply); if (!body) return;
+    if (!db.prepare('SELECT id FROM guest_requests WHERE id=?').get(guestId)) return fail(reply, 404, 'Не знайдено.');
+    db.prepare('UPDATE guest_requests SET status=?,processed_at=? WHERE id=?')
+      .run(body.status, body.status === 'new' ? null : now(), guestId);
+    audit(db, actor.id, 'guest_request.status', 'guest_request', guestId);
+    return { id: guestId, status: body.status };
   });
   app.get('/api/v1/admin/diagnostics', async (request, reply) => {
     if (!auth(request, reply, 'admin')) return;
