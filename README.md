@@ -46,7 +46,10 @@ Remove-Item Env:SELTIVO_ADMIN_PASSWORD
 | Збережені конфігурації | `GET/POST /configurations`, `GET/PATCH/DELETE /configurations/:id` |
 | Заявки | `GET/POST /requests`, `GET /requests/:id` |
 | Чат та сповіщення | `GET/POST /requests/:id/messages`, `PATCH /requests/:id/read`, `GET /notifications/unread-count`, `GET /notifications`, `PATCH /notifications/requests/:id/read` |
-| Адміністратор | `GET /admin/customers`, `GET /admin/customers/:id`, `GET /admin/requests`, `PATCH /admin/requests/:id/status`, `POST /admin/requests/:id/reopen`, `GET /admin/email-notifications`, `POST /admin/email-notifications/:id/retry`, `GET /admin/diagnostics`, `GET /admin/audit` |
+| Адміністратор | `GET /admin/customers`, `GET /admin/customers/:id` (з заявками, конфігураціями й лічильниками), `GET /admin/requests`, `PATCH /admin/requests/:id/status`, `POST /admin/requests/:id/reopen`, `GET /admin/email-notifications`, `POST /admin/email-notifications/:id/retry`, `GET /admin/overview` (метрики для дашборду), `GET /admin/diagnostics`, `GET /admin/audit` |
+| 2FA адміна | `GET /auth/2fa/status`, `POST /auth/2fa/setup` (потрібен пароль), `POST /auth/2fa/enable` (код TOTP), `POST /auth/2fa/disable` (пароль + код); у `POST /auth/login` поле `code` обов'язкове, коли 2FA увімкнено (код відновлення теж приймається один раз) |
+
+Адмінська сесія триває щонайбільше 12 год навіть з `rememberMe`. `SELTIVO_REQUIRE_ADMIN_2FA=1` забороняє вхід адміну без увімкненої 2FA — **спочатку** увімкніть 2FA на всіх адмінських акаунтах через `/admin/security`, і лише потім виставляйте прапорець (інакше адмін не зможе увійти, щоб налаштувати її). Секрети TOTP і хеші кодів відновлення зберігаються в таблиці `admin_two_factor` і потрапляють у логічні бекапи.
 
 Створення заявки вимагає `clientSubmissionId` (UUID); повідомлення — `clientMessageId` (UUID). Повторіть той самий ID і ті самі дані після timeout: сервер поверне попередній результат. Для оновлення конфігурації та статусу потрібен `If-Match` із поточною версією. Чужі заявки й конфігурації повертають 404.
 

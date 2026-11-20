@@ -4,7 +4,7 @@ import { randomUUID } from 'node:crypto';
 const base = process.env.SELTIVO_SMOKE_URL ?? 'http://127.0.0.1:8789';
 const origin = process.env.SELTIVO_SMOKE_ORIGIN ?? 'http://localhost:3011';
 const email = `delete-smoke-${randomUUID()}@example.test`;
-const password = 'SmokePassword123!';
+const password = `Smoke-${randomUUID()}!`;
 async function call(method, path, body, cookie) {
   const response = await fetch(`${base}${path}`, { method, headers: {
     Origin: origin, ...(body ? { 'Content-Type': 'application/json' } : {}), ...(cookie ? { Cookie: cookie } : {}),

@@ -3,7 +3,7 @@ import { randomUUID } from 'node:crypto';
 
 const base = process.env.SELTIVO_SMOKE_URL ?? 'http://127.0.0.1:8787';
 const origin = process.env.SELTIVO_SMOKE_ORIGIN ?? 'https://seltivo.seltivostudio.workers.dev';
-const password = 'SmokePassword123!';
+const password = `Smoke-${randomUUID()}!`;
 
 async function call(method, path, body, cookie, extraHeaders = {}) {
   const response = await fetch(`${base}${path}`, { method, headers: {

@@ -22,6 +22,8 @@ interface Env {
   BREVO_SENDER_EMAIL?: string;
   SELTIVO_ACCOUNT_DELETION_ENABLED?: string;
   SELTIVO_STAGING_TEST_KEY?: string;
+  SELTIVO_REQUIRE_EMAIL_VERIFICATION?: string;
+  SELTIVO_REQUIRE_ADMIN_2FA?: string;
 }
 
 function stagingControlsEnabled(env: Env): boolean {
@@ -54,6 +56,7 @@ export class SeltivoData extends DurableObject<Env> {
   private backupBucket: R2Bucket;
   private ledger: DurableObjectStub;
   private restoreProbe: boolean;
+  private preBodyWrites = new Map<string, number[]>();
 
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
@@ -80,13 +83,22 @@ export class SeltivoData extends DurableObject<Env> {
         VALUES (?,?,?,'admin','Seltivo Studio',?,?,?)`)
         .run(randomUUID(), normalizeEmail(env.SELTIVO_ADMIN_EMAIL), env.SELTIVO_ADMIN_PASSWORD_HASH, timestamp, timestamp, timestamp);
     }
+    const requireEmailVerification = env.SELTIVO_REQUIRE_EMAIL_VERIFICATION === '1';
+    const sendMail = brevoMail(env);
+    // Без пошти unverified-акаунти не зможуть підтвердити email і будуть
+    // заблоковані для заявок/конфігурацій — краще одразу впасти зі зрозумілою помилкою.
+    if (requireEmailVerification && !sendMail) {
+      throw new Error('SELTIVO_REQUIRE_EMAIL_VERIFICATION=1 requires BREVO_API_KEY and BREVO_SENDER_EMAIL');
+    }
     this.app = buildApp({
       db,
       origin: env.SELTIVO_PUBLIC_ORIGIN,
       secureCookies: !localOrigin,
+      requireEmailVerification,
+      requireAdmin2FA: env.SELTIVO_REQUIRE_ADMIN_2FA === '1',
       logger: false,
       router: createWorkerRouter(),
-      sendMail: brevoMail(env),
+      sendMail,
       teamEmail: env.SELTIVO_ADMIN_EMAIL,
       databaseBytes: () => ctx.storage.sql.databaseSize,
       deleteCustomer: env.SELTIVO_ACCOUNT_DELETION_ENABLED === '1' ? async (userId) => {
@@ -102,6 +114,31 @@ export class SeltivoData extends DurableObject<Env> {
         }
       } : undefined,
     });
+  }
+
+  // Грубий per-DO ліміт записів, який спрацьовує ДО читання тіла.
+  // Не підміняє точні ліміти в buildApp — лише відсікає явний flood,
+  // щоб 429-запити не виділяли 9 МБ і не робили JSON.parse у єдиному DO.
+  private preBodyAllow(ip: string): boolean {
+    const now = Date.now();
+    const recent = (this.preBodyWrites.get(ip) ?? []).filter((time) => now - time < 60_000);
+    if (recent.length >= 200) {
+      this.preBodyWrites.set(ip, recent);
+      return false;
+    }
+    recent.push(now);
+    this.preBodyWrites.set(ip, recent);
+    if (this.preBodyWrites.size > 5000) {
+      for (const [key, times] of this.preBodyWrites) {
+        if (!times.length || now - times[times.length - 1] >= 60_000) this.preBodyWrites.delete(key);
+      }
+      while (this.preBodyWrites.size > 5000) {
+        const oldest = this.preBodyWrites.keys().next().value;
+        if (oldest === undefined) break;
+        this.preBodyWrites.delete(oldest);
+      }
+    }
+    return true;
   }
 
   async fetch(request: Request): Promise<Response> {
@@ -150,13 +187,46 @@ export class SeltivoData extends DurableObject<Env> {
         return Response.json({ error: 'Backup failed' }, { status: 500 });
       }
     }
+    // Відсікаємо явний flood ще до читання тіла (див. preBodyAllow).
+    if (request.method !== 'GET' && request.method !== 'HEAD') {
+      const ip = request.headers.get('cf-connecting-ip')?.trim() || 'unknown';
+      if (!this.preBodyAllow(ip)) {
+        return Response.json({ error: 'Забагато запитів. Спробуйте пізніше.' }, { status: 429, headers: { 'Retry-After': '60' } });
+      }
+    }
+    const MAX_BODY = 9 * 1024 * 1024;
     const declaredLength = Number(request.headers.get('content-length') ?? 0);
-    if (!Number.isFinite(declaredLength) || declaredLength < 0 || declaredLength > 9 * 1024 * 1024) {
+    if (!Number.isFinite(declaredLength) || declaredLength < 0 || declaredLength > MAX_BODY) {
       return Response.json({ error: 'Запит завеликий.' }, { status: 413 });
     }
-    const body = request.method === 'GET' || request.method === 'HEAD'
-      ? undefined : Buffer.from(await request.arrayBuffer());
-    if (body && body.length > 9 * 1024 * 1024) return Response.json({ error: 'Запит завеликий.' }, { status: 413 });
+    let body: Buffer | undefined;
+    if (request.method !== 'GET' && request.method !== 'HEAD') {
+      if (request.body) {
+        // Читаємо потік шматками й відсікаємо одразу після перевищення ліміту:
+        // arrayBuffer() на 60–100 МБ вбиває єдиний Durable Object ще до перевірки.
+        const reader = request.body.getReader();
+        const chunks: Uint8Array[] = [];
+        let total = 0;
+        try {
+          while (true) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            if (!value) continue;
+            total += value.byteLength;
+            if (total > MAX_BODY) {
+              await reader.cancel().catch(() => {});
+              return Response.json({ error: 'Запит завеликий.' }, { status: 413 });
+            }
+            chunks.push(value);
+          }
+        } catch {
+          return Response.json({ error: 'Запит завеликий.' }, { status: 413 });
+        }
+        body = Buffer.concat(chunks, total);
+      } else {
+        body = Buffer.alloc(0);
+      }
+    }
     const result = await this.app.inject({
       method: request.method as 'GET',
       url: url.pathname + url.search,

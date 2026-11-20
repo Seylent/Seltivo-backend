@@ -6,6 +6,8 @@ import type { SeltivoDb } from './db.js';
 const scrypt = promisify(scryptCallback);
 const SHORT_SESSION_MS = 12 * 60 * 60 * 1000;
 const REMEMBER_SESSION_MS = 30 * 24 * 60 * 60 * 1000;
+// Адмін має доступ до всіх даних — навіть "remember me" не подовжує його понад 12 год.
+export const ADMIN_SESSION_MS = 12 * 60 * 60 * 1000;
 const MAX_SESSIONS_PER_USER = 10;
 const DUMMY_PASSWORD_HASH = `scrypt:${'0'.repeat(32)}:${'0'.repeat(128)}`;
 export const now = () => new Date().toISOString();
@@ -31,20 +33,22 @@ export async function verifyPassword(password: string, stored?: string | null) {
   return Boolean(stored && isValidPasswordHash(stored)) && matched;
 }
 
-export function createSession(db: SeltivoDb, userId: string, rememberMe = false) {
+export function createSession(db: SeltivoDb, userId: string, rememberMe = false, role: Actor['role'] = 'customer') {
   const timestamp = now();
   db.prepare('DELETE FROM sessions WHERE expires_at<=?').run(timestamp);
   db.prepare(`DELETE FROM sessions WHERE user_id=? AND token_hash NOT IN (
     SELECT token_hash FROM sessions WHERE user_id=? ORDER BY created_at DESC, token_hash DESC LIMIT ?
   )`).run(userId, userId, MAX_SESSIONS_PER_USER - 1);
   const token = randomBytes(32).toString('base64url');
+  const ttl = role === 'admin' ? ADMIN_SESSION_MS : (rememberMe ? REMEMBER_SESSION_MS : SHORT_SESSION_MS);
   db.prepare('INSERT INTO sessions(token_hash,user_id,expires_at,created_at) VALUES (?,?,?,?)')
-    .run(hashToken(token), userId, new Date(Date.now() + (rememberMe ? REMEMBER_SESSION_MS : SHORT_SESSION_MS)).toISOString(), timestamp);
+    .run(hashToken(token), userId, new Date(Date.now() + ttl).toISOString(), timestamp);
   return token;
 }
 
-export function sessionCookie(token: string, secure: boolean, rememberMe = false) {
-  return `seltivo_session=${token}; Path=/; HttpOnly; SameSite=Lax${rememberMe ? `; Max-Age=${REMEMBER_SESSION_MS / 1000}` : ''}${secure ? '; Secure' : ''}`;
+export function sessionCookie(token: string, secure: boolean, rememberMe = false, role: Actor['role'] = 'customer') {
+  const maxAge = rememberMe ? `; Max-Age=${(role === 'admin' ? ADMIN_SESSION_MS : REMEMBER_SESSION_MS) / 1000}` : '';
+  return `seltivo_session=${token}; Path=/; HttpOnly; SameSite=Lax${maxAge}${secure ? '; Secure' : ''}`;
 }
 
 export function clearSessionCookie(secure: boolean) {

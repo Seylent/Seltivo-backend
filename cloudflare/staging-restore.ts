@@ -11,7 +11,8 @@ type Env = { SELTIVO: DurableObjectNamespace; SELTIVO_PUBLIC_ORIGIN: string };
 function valid(value: unknown): value is Scenario {
   if (!value || typeof value !== 'object') return false;
   const body = value as Partial<Scenario>;
-  return typeof body.manifestKey === 'string' && body.manifestKey.startsWith('seltivo-backups/v1/')
+  return typeof body.manifestKey === 'string'
+    && /^seltivo-backups\/v1\/\d{4}-\d{2}-\d{2}\/[0-9a-f-]{36}\/manifest\.json$/.test(body.manifestKey)
     && Array.isArray(body.customers) && body.customers.length === 2
     && body.customers.every((customer) => typeof customer?.email === 'string' && typeof customer.password === 'string' && typeof customer.requestId === 'string')
     && Array.isArray(body.admins) && body.admins.length === 2

@@ -6,7 +6,7 @@ import { purgeCustomer } from './delete-account.js';
 const tables = [
   'users', 'sessions', 'auth_tokens', 'configurations', 'requests',
   'conversations', 'messages', 'conversation_reads', 'request_events',
-  'audit_log', 'email_notifications', 'notifications',
+  'audit_log', 'email_notifications', 'notifications', 'admin_two_factor',
 ] as const;
 type Table = typeof tables[number];
 type Row = Record<string, string | number | null>;
@@ -25,6 +25,9 @@ export type BackupManifest = {
 
 const latestVersion = MIGRATIONS.at(-1)?.version ?? 0;
 const prefix = 'seltivo-backups/v1/';
+//Keys come from a staging operator / internal call — validate the full shape, not just a prefix,
+// so `../` segments cannot escape the backup namespace.
+const manifestKeyPattern = /^seltivo-backups\/v1\/\d{4}-\d{2}-\d{2}\/[0-9a-f-]{36}\/manifest\.json$/;
 const encoder = new TextEncoder();
 
 function version(db: SeltivoDb): number {
@@ -118,7 +121,7 @@ export async function createLogicalBackup(db: SeltivoDb, store: Store, at = new 
 }
 
 export async function restoreLogicalBackup(db: SeltivoDb, store: Store, manifestKey: string, deletedIds: Iterable<string> = []): Promise<BackupManifest> {
-  if (!manifestKey.startsWith(prefix) || !manifestKey.endsWith('/manifest.json')) throw new Error('Invalid backup manifest key');
+  if (!manifestKeyPattern.test(manifestKey)) throw new Error('Invalid backup manifest key');
   assertSchema(db);
   const object = await store.get(manifestKey);
   if (!object) throw new Error('Backup manifest missing');
@@ -127,6 +130,8 @@ export async function restoreLogicalBackup(db: SeltivoDb, store: Store, manifest
     throw new Error('Incompatible backup manifest');
   }
   const base = manifestKey.slice(0, -'manifest.json'.length);
+  const escapedBase = base.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const chunkPattern = new RegExp(`^${escapedBase}(${tables.join('|')})/\\d{10}\\.json$`);
   const actualCounts = Object.fromEntries(tables.map((table) => [table, 0])) as Record<Table, number>;
   for (const table of tables) {
     if ((db.prepare(`SELECT COUNT(*) AS count FROM ${table}`).get() as { count: number }).count !== 0) {
@@ -134,7 +139,7 @@ export async function restoreLogicalBackup(db: SeltivoDb, store: Store, manifest
     }
   }
   for (const chunk of manifest.chunks) {
-    if (!tables.includes(chunk.table) || !chunk.key.startsWith(base) || chunk.key !== `${base}${chunk.table}/${chunk.key.split('/').at(-1)}`) throw new Error('Invalid backup chunk key');
+    if (!tables.includes(chunk.table) || !chunkPattern.test(chunk.key)) throw new Error('Invalid backup chunk key');
     const part = await store.get(chunk.key);
     if (!part) throw new Error('Backup chunk missing');
     const data = await part.text();

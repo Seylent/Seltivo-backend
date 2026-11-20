@@ -107,4 +107,12 @@ export const MIGRATIONS = [
     CREATE INDEX IF NOT EXISTS audit_actor ON audit_log(actor_id);
     CREATE INDEX IF NOT EXISTS audit_entity ON audit_log(entity_type, entity_id);
   ` },
+  { version: 5, sql: `
+    CREATE TABLE admin_two_factor (
+      user_id TEXT PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+      secret TEXT NOT NULL,
+      enabled_at TEXT,
+      recovery_codes TEXT NOT NULL
+    );
+  ` },
 ] as const;

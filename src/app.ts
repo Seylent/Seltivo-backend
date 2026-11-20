@@ -3,12 +3,15 @@ import Fastify, { type FastifyInstance, type FastifyReply, type FastifyRequest }
 import { z } from 'zod';
 import type { SeltivoDb } from './db.js';
 import { actorFromRequest, audit, clearSessionCookie, createSession, hashPassword, hashToken, newAuthToken, normalizeEmail, now, sessionCookie, sessionTokenFromRequest, verifyPassword, type Actor } from './auth.js';
+import { generateRecoveryCodes, generateTotpSecret, normalizeRecoveryCode, otpauthUri, verifyTotp } from './two-factor.js';
 
 const id = z.uuid();
 const email = z.email().max(254);
 const password = z.string().min(12).max(200);
 const contact = z.object({ name: z.string().trim().min(2).max(60), email: email.optional(), phone: z.string().trim().max(40).optional(), telegram: z.string().trim().max(80).optional() }).strict();
-const feature = z.enum(['telegram-orders', 'online-payment', 'admin-panel', 'personal-account', 'delivery', 'booking', 'blog', 'search', 'analytics', 'chat', 'other']);
+// Користувач може додати власну функцію прямо у формі (TagInput), тож жорсткий
+// enum тут відсікав би валідні заявки з 422 «Перевірте поля запиту».
+const feature = z.string().trim().min(1).max(80);
 const page = z.object({ offset: z.coerce.number().int().nonnegative().default(0), limit: z.coerce.number().int().min(1).max(100).default(50) });
 const statuses = ['submitted', 'reviewing', 'needs_info', 'in_progress', 'completed', 'cancelled'] as const;
 type Status = typeof statuses[number];
@@ -20,7 +23,7 @@ const transitions: Record<Status, Status[]> = {
 const fail = (reply: FastifyReply, status: number, error: string) => reply.code(status).send({ error });
 
 type Mail = (to: string, subject: string, text: string) => Promise<void>;
-export type AppOptions = { db: SeltivoDb; origin: string; secureCookies?: boolean; requireEmailVerification?: boolean; sendMail?: Mail; teamEmail?: string; databaseBytes?: () => number; deleteCustomer?: (userId: string) => Promise<void>; logger?: boolean; router?: FastifyInstance };
+export type AppOptions = { db: SeltivoDb; origin: string; secureCookies?: boolean; requireEmailVerification?: boolean; requireAdmin2FA?: boolean; sendMail?: Mail; teamEmail?: string; databaseBytes?: () => number; deleteCustomer?: (userId: string) => Promise<void>; logger?: boolean; router?: FastifyInstance };
 const MAX_CONFIGURATIONS_PER_USER = 50;
 const RETENTION_MS = 30 * 24 * 60 * 60 * 1000;
 const PNG_SIGNATURE = Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]);
@@ -58,7 +61,7 @@ function configJson(value: unknown): string | null {
   return Buffer.byteLength(json) <= 8 * 1024 * 1024 ? json : null;
 }
 
-export function buildApp({ db, origin, secureCookies = false, requireEmailVerification = process.env.SELTIVO_REQUIRE_EMAIL_VERIFICATION === '1', sendMail, teamEmail, databaseBytes, deleteCustomer, logger = process.env.NODE_ENV !== 'test', router }: AppOptions) {
+export function buildApp({ db, origin, secureCookies = false, requireEmailVerification = process.env.SELTIVO_REQUIRE_EMAIL_VERIFICATION === '1', requireAdmin2FA = process.env.SELTIVO_REQUIRE_ADMIN_2FA === '1', sendMail, teamEmail, databaseBytes, deleteCustomer, logger = process.env.NODE_ENV !== 'test', router }: AppOptions) {
   const app = router ?? Fastify({ logger, bodyLimit: 9 * 1024 * 1024, trustProxy: process.env.SELTIVO_TRUST_PROXY === '1' });
   const attempts = new Map<string, number[]>();
   const pruneAttempts = (current: number) => {
@@ -101,6 +104,11 @@ export function buildApp({ db, origin, secureCookies = false, requireEmailVerifi
   };
   const rateLimitBucket = (method: string, rawPath: string): { bucket: string; windowMs: number; max: number } | null => {
     const path = rawPath.length > 1 ? rawPath.replace(/\/+$/, '') : rawPath;
+    // Адмінські запити змінюють статуси заявок і запускають відправку листів —
+    // окремий спільний ліміт, інакше retry-ендпоінт можна закидати листами.
+    if (path.startsWith('/api/v1/admin/') && ['POST', 'PATCH', 'DELETE'].includes(method)) {
+      return { bucket: 'WRITE:/api/v1/admin', windowMs: 60_000, max: 30 };
+    }
     if (method === 'POST') {
       if (path === '/api/v1/auth/register' || path === '/api/v1/auth/forgot-password' || path === '/api/v1/auth/resend-verification') {
         return { bucket: `POST:${path}`, windowMs: 15 * 60_000, max: 5 };
@@ -117,6 +125,9 @@ export function buildApp({ db, origin, secureCookies = false, requireEmailVerifi
       if (path === '/api/v1/me') return { bucket: 'PATCH:/api/v1/me', windowMs: 60_000, max: 20 };
     }
     if (method === 'DELETE' && path === '/api/v1/me') return { bucket: 'DELETE:/api/v1/me', windowMs: 60_000, max: 10 };
+    // GET дешеві, але необмежені читання (зокрема diagnostics з quick_check)
+    // дозволяють зайняти єдиний Durable Object. Загальний м'який ліміт на IP.
+    if (method === 'GET' || method === 'HEAD') return { bucket: 'READ:global', windowMs: 60_000, max: 120 };
     return null;
   };
   const unreadCache = new Map<string, { value: unknown; expires: number }>();
@@ -155,6 +166,24 @@ export function buildApp({ db, origin, secureCookies = false, requireEmailVerifi
       app.log.error({ event: 'email_delivery_failed', kind: 'chat', notificationId, code });
       return 'failed';
     }
+  };
+  type TwoFactorRow = { secret: string; enabled_at: string | null; recovery_codes: string };
+  const twoFactorRow = (userId: string) => db.prepare('SELECT secret,enabled_at,recovery_codes FROM admin_two_factor WHERE user_id=?').get(userId) as TwoFactorRow | undefined;
+  const consumeRecoveryCode = (codesJson: string, code: string) => {
+    let codes: string[];
+    try { codes = JSON.parse(codesJson) as string[]; } catch { return null; }
+    if (!Array.isArray(codes)) return null;
+    const target = hashToken(normalizeRecoveryCode(code));
+    const index = codes.indexOf(target);
+    if (index < 0) return null;
+    codes.splice(index, 1);
+    return JSON.stringify(codes);
+  };
+  const recoveryRemaining = (codesJson: string) => {
+    try {
+      const value = JSON.parse(codesJson);
+      return Array.isArray(value) ? value.length : 0;
+    } catch { return 0; }
   };
   const auth = (request: FastifyRequest, reply: FastifyReply, role?: 'customer' | 'admin') => {
     const actor = actorFromRequest(db, request);
@@ -234,7 +263,13 @@ export function buildApp({ db, origin, secureCookies = false, requireEmailVerifi
   app.post('/api/v1/auth/resend-verification', async (request, reply) => {
     const body = parse(z.object({ email }).strict(), request.body, reply);
     if (!body) return;
-    const user = db.prepare('SELECT id,email,email_verified_at FROM users WHERE email=? AND disabled_at IS NULL').get(normalizeEmail(body.email)) as any;
+    const normalized = normalizeEmail(body.email);
+    // Per-account ліміт: per-IP легко обійти ротацією адрес. Лічимо незалежно
+    // від існування акаунта, щоб відповідь не розкривала, чи email зареєстрований.
+    const limitKey = `email:resend:${normalized}`;
+    if (!checkRateLimit(limitKey, 15 * 60_000, 5, reply, false)) return;
+    recordAttempt(limitKey, 15 * 60_000);
+    const user = db.prepare('SELECT id,email,email_verified_at FROM users WHERE email=? AND disabled_at IS NULL').get(normalized) as any;
     if (user && !user.email_verified_at && sendMail) {
       const token = newAuthToken(db, user.id, 'verify', 24 * 60 * 60 * 1000);
       await mail(user.email, 'Підтвердьте email SELTIVO', `${origin}/verify-email?token=${token}`);
@@ -253,7 +288,7 @@ export function buildApp({ db, origin, secureCookies = false, requireEmailVerifi
     return { ok: true };
   });
   app.post('/api/v1/auth/login', async (request, reply) => {
-    const body = parse(z.object({ email, password: z.string().max(200), rememberMe: z.boolean().optional() }).strict(), request.body, reply);
+    const body = parse(z.object({ email, password: z.string().max(200), rememberMe: z.boolean().optional(), code: z.string().trim().max(32).optional() }).strict(), request.body, reply);
     if (!body) return;
     const normalized = normalizeEmail(body.email);
     const emailLimitKey = `email:login:${normalized}`;
@@ -263,14 +298,31 @@ export function buildApp({ db, origin, secureCookies = false, requireEmailVerifi
       recordAttempt(emailLimitKey, 15 * 60_000);
       return fail(reply, 401, 'Невірний email або пароль.');
     }
+    let updatedRecoveryCodes: string | null = null;
+    if (user.role === 'admin') {
+      const factor = twoFactorRow(user.id);
+      if (factor?.enabled_at) {
+        if (!body.code) return reply.code(428).send({ error: 'Введіть код з застосунку авторизації.', twoFactorRequired: true });
+        const code = body.code.trim();
+        const remaining = /^[A-Za-z0-9-]{8,20}$/.test(code) ? consumeRecoveryCode(factor.recovery_codes, code) : null;
+        if (remaining === null && !verifyTotp(code, factor.secret)) {
+          recordAttempt(emailLimitKey, 15 * 60_000);
+          return fail(reply, 401, 'Невірний email або пароль.');
+        }
+        updatedRecoveryCodes = remaining;
+      } else if (requireAdmin2FA) {
+        return reply.code(403).send({ error: 'Для адміністратора потрібно увімкнути двофакторну авторизацію.', twoFactorEnrollmentRequired: true });
+      }
+    }
     attempts.delete(emailLimitKey);
     const token = db.transaction(() => {
       const previous = sessionTokenFromRequest(request);
       if (previous) db.prepare('DELETE FROM sessions WHERE token_hash=?').run(hashToken(previous));
-      return createSession(db, user.id, body.rememberMe);
+      if (updatedRecoveryCodes !== null) db.prepare('UPDATE admin_two_factor SET recovery_codes=? WHERE user_id=?').run(updatedRecoveryCodes, user.id);
+      return createSession(db, user.id, body.rememberMe, user.role);
     })();
     if (user.role === 'admin') audit(db, user.id, 'auth.login', 'user', user.id);
-    reply.header('Set-Cookie', sessionCookie(token, secureCookies, body.rememberMe));
+    reply.header('Set-Cookie', sessionCookie(token, secureCookies, body.rememberMe, user.role));
     return { user: { id: user.id, email: user.email, name: user.name, role: user.role, emailVerified: Boolean(user.email_verified_at) } };
   });
   app.post('/api/v1/auth/logout', async (request, reply) => {
@@ -279,10 +331,83 @@ export function buildApp({ db, origin, secureCookies = false, requireEmailVerifi
     reply.header('Set-Cookie', clearSessionCookie(secureCookies));
     return reply.code(204).send();
   });
+  app.get('/api/v1/auth/2fa/status', async (request, reply) => {
+    const actor = auth(request, reply, 'admin'); if (!actor) return;
+    const factor = twoFactorRow(actor.id);
+    return {
+      enabled: Boolean(factor?.enabled_at),
+      pending: Boolean(factor && !factor.enabled_at),
+      recoveryCodesRemaining: factor ? recoveryRemaining(factor.recovery_codes) : 0,
+    };
+  });
+  app.post('/api/v1/auth/2fa/setup', async (request, reply) => {
+    const actor = auth(request, reply, 'admin'); if (!actor) return;
+    const body = parse(z.object({ password: z.string().max(200) }).strict(), request.body, reply); if (!body) return;
+    const limitKey = `2fa:setup:${actor.id}`;
+    if (!checkRateLimit(limitKey, 15 * 60_000, 5, reply, false)) return;
+    const user = db.prepare('SELECT password_hash FROM users WHERE id=?').get(actor.id) as { password_hash: string } | undefined;
+    if (!await verifyPassword(body.password, user?.password_hash)) {
+      recordAttempt(limitKey, 15 * 60_000);
+      return fail(reply, 401, 'Невірний пароль.');
+    }
+    if (twoFactorRow(actor.id)?.enabled_at) return fail(reply, 409, '2FA вже увімкнено.');
+    const secret = generateTotpSecret();
+    const recoveryCodes = generateRecoveryCodes();
+    const hashes = JSON.stringify(recoveryCodes.map((code) => hashToken(normalizeRecoveryCode(code))));
+    db.prepare(`INSERT INTO admin_two_factor(user_id,secret,enabled_at,recovery_codes) VALUES (?,?,NULL,?)
+      ON CONFLICT(user_id) DO UPDATE SET secret=excluded.secret,recovery_codes=excluded.recovery_codes,enabled_at=NULL`)
+      .run(actor.id, secret, hashes);
+    audit(db, actor.id, 'auth.2fa.setup', 'user', actor.id);
+    return { secret, uri: otpauthUri(secret, actor.email), recoveryCodes };
+  });
+  app.post('/api/v1/auth/2fa/enable', async (request, reply) => {
+    const actor = auth(request, reply, 'admin'); if (!actor) return;
+    const body = parse(z.object({ code: z.string().trim().regex(/^\d{6}$/) }).strict(), request.body, reply); if (!body) return;
+    const limitKey = `2fa:enable:${actor.id}`;
+    if (!checkRateLimit(limitKey, 15 * 60_000, 5, reply, false)) return;
+    const factor = twoFactorRow(actor.id);
+    if (!factor || factor.enabled_at) return fail(reply, 409, 'Спочатку налаштуйте 2FA.');
+    if (!verifyTotp(body.code, factor.secret)) {
+      recordAttempt(limitKey, 15 * 60_000);
+      return fail(reply, 422, 'Невірний код.');
+    }
+    const result = db.prepare('UPDATE admin_two_factor SET enabled_at=? WHERE user_id=? AND enabled_at IS NULL').run(now(), actor.id);
+    if (!result.changes) return fail(reply, 409, '2FA вже увімкнено.');
+    audit(db, actor.id, 'auth.2fa.enable', 'user', actor.id);
+    return { ok: true };
+  });
+  app.post('/api/v1/auth/2fa/disable', async (request, reply) => {
+    const actor = auth(request, reply, 'admin'); if (!actor) return;
+    const body = parse(z.object({ password: z.string().max(200), code: z.string().trim().max(32) }).strict(), request.body, reply); if (!body) return;
+    const limitKey = `2fa:disable:${actor.id}`;
+    if (!checkRateLimit(limitKey, 15 * 60_000, 5, reply, false)) return;
+    const user = db.prepare('SELECT password_hash FROM users WHERE id=?').get(actor.id) as { password_hash: string } | undefined;
+    if (!await verifyPassword(body.password, user?.password_hash)) {
+      recordAttempt(limitKey, 15 * 60_000);
+      return fail(reply, 401, 'Невірний пароль.');
+    }
+    const factor = twoFactorRow(actor.id);
+    if (!factor?.enabled_at) return fail(reply, 409, '2FA не увімкнено.');
+    const code = body.code.trim();
+    const remaining = /^[A-Za-z0-9-]{8,20}$/.test(code) ? consumeRecoveryCode(factor.recovery_codes, code) : null;
+    if (remaining === null && !verifyTotp(code, factor.secret)) {
+      recordAttempt(limitKey, 15 * 60_000);
+      return fail(reply, 422, 'Невірний код.');
+    }
+    db.prepare('DELETE FROM admin_two_factor WHERE user_id=?').run(actor.id);
+    audit(db, actor.id, 'auth.2fa.disable', 'user', actor.id);
+    return { ok: true };
+  });
   app.post('/api/v1/auth/forgot-password', async (request, reply) => {
     const body = parse(z.object({ email }).strict(), request.body, reply);
     if (!body) return;
-    const user = db.prepare('SELECT id,email FROM users WHERE email=? AND disabled_at IS NULL').get(normalizeEmail(body.email)) as any;
+    const normalized = normalizeEmail(body.email);
+    // Per-account ліміт: інакше ботнет із різних IP закидає одну пошту листами.
+    // Лічимо до перевірки існування акаунта — відповідь лишається 202 завжди.
+    const limitKey = `email:forgot:${normalized}`;
+    if (!checkRateLimit(limitKey, 15 * 60_000, 5, reply, false)) return;
+    recordAttempt(limitKey, 15 * 60_000);
+    const user = db.prepare('SELECT id,email FROM users WHERE email=? AND disabled_at IS NULL').get(normalized) as any;
     if (user && sendMail) {
       const token = newAuthToken(db, user.id, 'reset', 30 * 60 * 1000);
       await mail(user.email, 'Відновлення пароля SELTIVO', `${origin}/reset-password?token=${token}`);
@@ -387,14 +512,14 @@ export function buildApp({ db, origin, secureCookies = false, requireEmailVerifi
     return reply.code(204).send();
   });
 
-  const requestBody = z.object({ templateId: z.string().regex(/^[a-z0-9-]{1,60}$/), templateName: z.string().trim().min(1).max(80), configurationId: id.nullable().optional(), contact, note: z.string().trim().max(2000).default(''), features: z.array(feature).max(5).default([]), clientSubmissionId: id }).strict();
+  const requestBody = z.object({ templateId: z.string().regex(/^[a-z0-9-]{1,60}$/), templateName: z.string().trim().min(1).max(80), configurationId: id.nullable().optional(), contact, note: z.string().trim().max(2000).default(''), features: z.array(feature).max(12).default([]), clientSubmissionId: id }).strict();
   app.post('/api/v1/requests', async (request, reply) => {
     const actor = auth(request, reply, 'customer'); if (!actor || !verified(actor, reply)) return;
     const body = parse(requestBody, request.body, reply); if (!body) return;
     const existing = db.prepare('SELECT r.id,r.status,c.id conversationId FROM requests r JOIN conversations c ON c.request_id=r.id WHERE r.customer_id=? AND r.client_submission_id=?').get(actor.id, body.clientSubmissionId);
     if (existing) {
-      const prior = db.prepare('SELECT template_id,configuration_id,contact_json,note,features_json FROM requests WHERE id=?').get((existing as any).id) as any;
-      if (prior.template_id !== body.templateId || prior.configuration_id !== (body.configurationId ?? null) || prior.contact_json !== JSON.stringify(body.contact) || prior.note !== body.note || prior.features_json !== JSON.stringify(body.features)) return fail(reply, 409, 'Ключ повтору вже використано.');
+      const prior = db.prepare('SELECT template_id,template_name,configuration_id,contact_json,note,features_json FROM requests WHERE id=?').get((existing as any).id) as any;
+      if (prior.template_id !== body.templateId || prior.template_name !== body.templateName || prior.configuration_id !== (body.configurationId ?? null) || prior.contact_json !== JSON.stringify(body.contact) || prior.note !== body.note || prior.features_json !== JSON.stringify(body.features)) return fail(reply, 409, 'Ключ повтору вже використано.');
       return reply.code(200).send(existing);
     }
     let snapshot: string | null = null;
@@ -543,9 +668,21 @@ export function buildApp({ db, origin, secureCookies = false, requireEmailVerifi
   });
   app.get('/api/v1/admin/customers/:id', async (request, reply) => {
     if (!auth(request, reply, 'admin')) return;
-    const row = db.prepare("SELECT id,email,name,phone,telegram,created_at createdAt FROM users WHERE id=? AND role='customer'").get((request.params as any).id);
+    const customerId = (request.params as { id: string }).id;
+    type CustomerRow = { id: string; email: string; name: string; phone: string | null; telegram: string | null; createdAt: string; emailVerifiedAt: string | null };
+    const row = db.prepare("SELECT id,email,name,phone,telegram,created_at createdAt,email_verified_at emailVerifiedAt FROM users WHERE id=? AND role='customer'").get(customerId) as CustomerRow | undefined;
     if (!row) return fail(reply, 404, 'Не знайдено.');
-    return row;
+    const requests = db.prepare(`SELECT id,template_name templateName,status,created_at createdAt,updated_at updatedAt
+      FROM requests WHERE customer_id=? ORDER BY created_at DESC,id DESC LIMIT 30`).all(customerId);
+    const configurations = db.prepare(`SELECT id,template_id templateId,name,revision,updated_at updatedAt
+      FROM configurations WHERE owner_id=? AND deleted_at IS NULL ORDER BY updated_at DESC,id DESC LIMIT 30`).all(customerId);
+    type CustomerStats = { requestsCount: number; configurationsCount: number; messagesCount: number };
+    const stats = db.prepare(`SELECT
+      (SELECT COUNT(*) FROM requests WHERE customer_id=?) requestsCount,
+      (SELECT COUNT(*) FROM configurations WHERE owner_id=? AND deleted_at IS NULL) configurationsCount,
+      (SELECT COUNT(*) FROM messages m JOIN conversations c ON c.id=m.conversation_id JOIN requests r ON r.id=c.request_id WHERE r.customer_id=?) messagesCount`)
+      .get(customerId, customerId, customerId) as CustomerStats;
+    return { ...row, requests, configurations, stats };
   });
   app.get('/api/v1/admin/requests', async (request, reply) => {
     if (!auth(request, reply, 'admin')) return;
@@ -598,6 +735,49 @@ export function buildApp({ db, origin, secureCookies = false, requireEmailVerifi
     const foreignKeys = (db.pragma('foreign_key_check') as unknown[]).length;
     return { ok: integrity === 'ok' && foreignKeys === 0, integrity, foreignKeyViolations: foreignKeys,
       databaseBytes: databaseBytes?.() ?? null, emailConfigured: Boolean(sendMail) };
+  });
+  app.get('/api/v1/admin/overview', async (request, reply) => {
+    const actor = auth(request, reply, 'admin'); if (!actor) return;
+    const since = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString();
+    // Статичні фрагменти SQL — значення статусів не підставляються ззовні.
+    const requests = db.prepare(`SELECT COUNT(*) total,
+      SUM(CASE WHEN created_at>=? THEN 1 ELSE 0 END) last7Days,
+      SUM(CASE WHEN status='submitted' THEN 1 ELSE 0 END) submitted,
+      SUM(CASE WHEN status='reviewing' THEN 1 ELSE 0 END) reviewing,
+      SUM(CASE WHEN status='needs_info' THEN 1 ELSE 0 END) needsInfo,
+      SUM(CASE WHEN status='in_progress' THEN 1 ELSE 0 END) inProgress,
+      SUM(CASE WHEN status='completed' THEN 1 ELSE 0 END) completed,
+      SUM(CASE WHEN status='cancelled' THEN 1 ELSE 0 END) cancelled
+      FROM requests`).get(since) as Record<string, number | null>;
+    const customers = db.prepare(`SELECT COUNT(*) total, SUM(CASE WHEN created_at>=? THEN 1 ELSE 0 END) last7Days
+      FROM users WHERE role='customer'`).get(since) as { total: number | null; last7Days: number | null };
+    const unread = db.prepare(`SELECT COUNT(m.id) total FROM requests r
+      JOIN conversations c ON c.request_id=r.id
+      JOIN messages m ON m.conversation_id=c.id AND m.sender_id<>?
+      LEFT JOIN conversation_reads cr ON cr.conversation_id=c.id AND cr.user_id=?
+      WHERE m.id>COALESCE(cr.last_read_message_id,0)`).get(actor.id, actor.id) as { total: number | null };
+    const emailProblems = (db.prepare("SELECT COUNT(*) count FROM email_notifications WHERE status IN ('pending','failed')").get() as { count: number }).count;
+    const integrity = db.pragma('quick_check', { simple: true });
+    const foreignKeys = (db.pragma('foreign_key_check') as unknown[]).length;
+    const recentAudit = db.prepare(`SELECT a.id,a.action,a.entity_type entityType,a.entity_id entityId,a.created_at createdAt,u.name actorName
+      FROM audit_log a JOIN users u ON u.id=a.actor_id ORDER BY a.created_at DESC,a.rowid DESC LIMIT 6`).all();
+    const number = (value: number | null | undefined) => Number(value ?? 0);
+    return {
+      requests: {
+        total: number(requests.total), last7Days: number(requests.last7Days),
+        byStatus: {
+          submitted: number(requests.submitted), reviewing: number(requests.reviewing),
+          needsInfo: number(requests.needsInfo), inProgress: number(requests.inProgress),
+          completed: number(requests.completed), cancelled: number(requests.cancelled),
+        },
+      },
+      customers: { total: number(customers.total), last7Days: number(customers.last7Days) },
+      messages: { unread: number(unread.total) },
+      email: { problems: emailProblems },
+      system: { ok: integrity === 'ok' && foreignKeys === 0, integrity, foreignKeyViolations: foreignKeys,
+        databaseBytes: databaseBytes?.() ?? null, emailConfigured: Boolean(sendMail) },
+      recentAudit,
+    };
   });
   app.get('/api/v1/admin/email-notifications', async (request, reply) => {
     if (!auth(request, reply, 'admin')) return;

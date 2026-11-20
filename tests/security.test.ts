@@ -191,3 +191,33 @@ test('sessions per user are capped and soft-deleted configurations free their pa
     assert.ok(stored.deleted_at);
   } finally { db.close(); }
 });
+
+test('read requests have a bounded global rate limit', async () => {
+  const db = openDatabase(':memory:');
+  const app = buildApp({ db, origin, router: createWorkerRouter() });
+  try {
+    for (let attempt = 0; attempt < 120; attempt += 1) {
+      const response = await app.inject({ method: 'GET', url: '/api/v1/health', headers: { origin } });
+      assert.equal(response.statusCode, 200);
+    }
+    const limited = await app.inject({ method: 'GET', url: '/api/v1/health', headers: { origin } });
+    assert.equal(limited.statusCode, 429);
+    assert.ok(Number(limited.headers['retry-after']) > 0);
+  } finally { db.close(); }
+});
+
+test('admin write endpoints are throttled before authentication', async () => {
+  const db = openDatabase(':memory:');
+  const app = buildApp({ db, origin, router: createWorkerRouter() });
+  try {
+    const url = `/api/v1/admin/requests/${randomUUID()}/reopen`;
+    const payload = Buffer.from(JSON.stringify({ reason: 'rate limit check' }));
+    for (let attempt = 0; attempt < 30; attempt += 1) {
+      const response = await app.inject({ method: 'POST', url, headers: { origin }, payload });
+      assert.equal(response.statusCode, 401);
+    }
+    const limited = await app.inject({ method: 'POST', url, headers: { origin }, payload });
+    assert.equal(limited.statusCode, 429);
+    assert.ok(Number(limited.headers['retry-after']) > 0);
+  } finally { db.close(); }
+});
