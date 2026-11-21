@@ -329,6 +329,7 @@ export function buildApp({ db, origin, secureCookies = false, requireEmailVerifi
       if (!same) return fail(reply, 409, 'Ключ повтору вже використано.');
       if (body.telegramStatus === 'sent') db.prepare("UPDATE guest_requests SET telegram_status='sent' WHERE id=?").run(body.id);
     }
+    if (stored.changes) chatEvents.publish('', { kind: 'request', requestId: body.id });
     return reply.code(stored.changes ? 201 : 200).send({ id: body.id });
   });
   app.post('/api/v1/auth/login', async (request, reply) => {
@@ -585,7 +586,10 @@ export function buildApp({ db, origin, secureCookies = false, requireEmailVerifi
         VALUES (?,?,?,?,?,?,?,?,?,?,'submitted',?,?)`).run(requestId, actor.id, body.templateId, body.templateName, body.configurationId ?? null, snapshot, JSON.stringify(body.contact), body.note, JSON.stringify(body.features), body.clientSubmissionId, timestamp, timestamp);
       db.prepare('INSERT INTO conversations(id,request_id,created_at) VALUES (?,?,?)').run(conversationId, requestId, timestamp);
       db.prepare('INSERT INTO request_events(id,request_id,actor_id,old_status,new_status,reason,created_at) VALUES (?,?,?,NULL,?,?,?)').run(randomUUID(), requestId, actor.id, 'submitted', '', timestamp);
+      audit(db, actor.id, 'request.created', 'request', requestId);
     })();
+    // Нова заявка — це не повідомлення чату, але адміни мають бачити її одразу.
+    chatEvents.publish(actor.id, { kind: 'request', requestId });
     return reply.code(201).send({ id: requestId, status: 'submitted', conversationId });
   });
   app.get('/api/v1/requests', async (request, reply) => {

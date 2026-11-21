@@ -115,6 +115,7 @@ test('registration, ownership, idempotent requests, chat and admin status', asyn
     const auditLog = await call('GET', '/api/v1/admin/audit', undefined, admin);
     assert.equal(auditLog.status, 200);
     assert.ok(auditLog.body.items.some((item: { action: string }) => item.action === 'request.reopen'));
+    assert.ok(auditLog.body.items.some((item: { action: string }) => item.action === 'request.created'));
     assert.equal((await call('GET', '/api/v1/admin/customers', undefined, alice)).status, 403);
     const invalid = await app.inject({ method: 'POST', url: '/api/v1/auth/login', headers: { origin, 'content-type': 'application/json' }, payload: '{' });
     assert.equal(invalid.statusCode, 400);

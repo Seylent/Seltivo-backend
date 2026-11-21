@@ -1,6 +1,6 @@
 import type { Actor } from './auth.js';
 
-type ChatEvent = { kind: 'message' | 'status'; requestId: string };
+type ChatEvent = { kind: 'message' | 'status' | 'request'; requestId: string };
 type Subscriber = { actor: Actor; send: (frame: Uint8Array) => void };
 
 export function createChatEvents() {
