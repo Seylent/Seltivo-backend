@@ -4,6 +4,8 @@ import { z } from 'zod';
 import type { SeltivoDb } from './db.js';
 import { actorFromRequest, audit, clearSessionCookie, createSession, hashPassword, hashToken, newAuthToken, normalizeEmail, now, sessionCookie, sessionTokenFromRequest, verifyPassword, type Actor } from './auth.js';
 import { generateRecoveryCodes, generateTotpSecret, normalizeRecoveryCode, otpauthUri, verifyTotp } from './two-factor.js';
+import { trialSnapshot } from './trial.js';
+import { createChatEvents } from './chat-events.js';
 
 const id = z.uuid();
 const email = z.email().max(254);
@@ -17,8 +19,9 @@ const guestRequest = z.object({
   budget: z.string().trim().max(60),
   note: z.string().trim().max(1800),
   templateName: z.string().trim().max(120).optional(),
+  trial: trialSnapshot.optional(),
   telegramStatus: z.enum(['sent', 'failed']),
-}).strict().refine((data) => data.features.length > 0 || data.note.length > 0, {
+}).strict().refine((data) => data.trial ? Boolean(data.templateName) : data.features.length > 0 || data.note.length > 0, {
   message: 'Додайте хоча б одну функцію або опишіть задачу.',
   path: ['note'],
 });
@@ -49,9 +52,14 @@ function parse<T>(schema: z.ZodType<T>, body: unknown, reply: FastifyReply): T |
   return result.data;
 }
 
-function configJson(value: unknown): string | null {
+function configJson(value: unknown, templateId: string): string | null {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
   const data = value as Record<string, unknown>;
+  if ('changes' in data || 'trial' in data) {
+    const snapshot = trialSnapshot.safeParse('trial' in data ? data.trial : data);
+    if (!snapshot.success || snapshot.data.templateId !== templateId) return null;
+    if (!('trial' in data)) return JSON.stringify(snapshot.data);
+  }
   if (typeof data.name !== 'string' || typeof data.id !== 'string' || !data.colors || !data.hero || !data.home || !Array.isArray(data.products)) return null;
   let images = 0;
   const walk = (node: unknown, depth: number): boolean => {
@@ -77,6 +85,7 @@ function configJson(value: unknown): string | null {
 
 export function buildApp({ db, origin, secureCookies = false, requireEmailVerification = process.env.SELTIVO_REQUIRE_EMAIL_VERIFICATION === '1', requireAdmin2FA = process.env.SELTIVO_REQUIRE_ADMIN_2FA === '1', sendMail, teamEmail, databaseBytes, deleteCustomer, logger = process.env.NODE_ENV !== 'test', router }: AppOptions) {
   const app = router ?? Fastify({ logger, bodyLimit: 9 * 1024 * 1024, trustProxy: process.env.SELTIVO_TRUST_PROXY === '1' });
+  const chatEvents = createChatEvents();
   const attempts = new Map<string, number[]>();
   const pruneAttempts = (current: number) => {
     if (attempts.size <= 10_000) return;
@@ -224,7 +233,7 @@ export function buildApp({ db, origin, secureCookies = false, requireEmailVerifi
     }
   });
   app.addHook('onSend', async (_request, reply, payload) => {
-    reply.header('Cache-Control', 'private, no-store');
+    if (!reply.hasHeader('Cache-Control')) reply.header('Cache-Control', 'private, no-store');
     reply.header('X-Content-Type-Options', 'nosniff');
     reply.header('X-Frame-Options', 'DENY');
     reply.header('Referrer-Policy', 'no-referrer');
@@ -306,11 +315,20 @@ export function buildApp({ db, origin, secureCookies = false, requireEmailVerifi
   // Telegram-доставку виконує Next-route; сюди приходить уже знаний результат.
   app.post('/api/v1/guest-requests', async (request, reply) => {
     const body = parse(guestRequest, request.body, reply); if (!body) return;
+    const trial = body.trial ? JSON.stringify(body.trial) : null;
+    const features = JSON.stringify(body.features);
     const stored = db.prepare(`INSERT OR IGNORE INTO guest_requests
-      (id,name,contact,features_json,budget,note,template_name,telegram_status,status,created_at)
-      VALUES (?,?,?,?,?,?,?,?,'new',?)`)
-      .run(body.id, body.name, body.contact, JSON.stringify(body.features), body.budget, body.note,
-        body.templateName ?? null, body.telegramStatus, now());
+      (id,name,contact,features_json,budget,note,template_name,telegram_status,status,created_at,trial_json)
+      VALUES (?,?,?,?,?,?,?,?,'new',?,?)`)
+      .run(body.id, body.name, body.contact, features, body.budget, body.note,
+        body.templateName ?? null, body.telegramStatus, now(), trial);
+    if (!stored.changes && trial) {
+      const same = db.prepare(`SELECT id FROM guest_requests WHERE id=? AND name=? AND contact=? AND features_json=?
+        AND budget=? AND note=? AND template_name=? AND trial_json=?`)
+        .get(body.id, body.name, body.contact, features, body.budget, body.note, body.templateName, trial);
+      if (!same) return fail(reply, 409, 'Ключ повтору вже використано.');
+      if (body.telegramStatus === 'sent') db.prepare("UPDATE guest_requests SET telegram_status='sent' WHERE id=?").run(body.id);
+    }
     return reply.code(stored.changes ? 201 : 200).send({ id: body.id });
   });
   app.post('/api/v1/auth/login', async (request, reply) => {
@@ -506,7 +524,7 @@ export function buildApp({ db, origin, secureCookies = false, requireEmailVerifi
     const body = parse(configBody, request.body, reply); if (!body) return;
     const activeCount = (db.prepare('SELECT COUNT(*) AS count FROM configurations WHERE owner_id=? AND deleted_at IS NULL').get(actor.id) as { count: number }).count;
     if (activeCount >= MAX_CONFIGURATIONS_PER_USER) return fail(reply, 422, 'Досягнуто ліміту збережених конфігурацій.');
-    const json = configJson(body.data); if (!json) return fail(reply, 422, 'Конфігурація завелика або пошкоджена.');
+    const json = configJson(body.data, body.templateId); if (!json) return fail(reply, 422, 'Конфігурація завелика або пошкоджена.');
     const configId = randomUUID(), timestamp = now();
     db.prepare('INSERT INTO configurations(id,owner_id,template_id,name,data_json,created_at,updated_at) VALUES (?,?,?,?,?,?,?)')
       .run(configId, actor.id, body.templateId, body.name, json, timestamp, timestamp);
@@ -522,13 +540,16 @@ export function buildApp({ db, origin, secureCookies = false, requireEmailVerifi
   app.patch('/api/v1/configurations/:id', async (request, reply) => {
     const actor = auth(request, reply, 'customer'); if (!actor || !verified(actor, reply)) return;
     const body = parse(z.object({ name: z.string().trim().min(1).max(80), data: z.unknown() }).strict(), request.body, reply); if (!body) return;
-    const json = configJson(body.data); if (!json) return fail(reply, 422, 'Конфігурація завелика або пошкоджена.');
     const revision = Number(request.headers['if-match']);
     if (!Number.isInteger(revision) || revision < 1) return fail(reply, 400, 'Потрібна версія If-Match.');
+    const configId = (request.params as { id: string }).id;
+    const existing = db.prepare('SELECT template_id FROM configurations WHERE id=? AND owner_id=? AND deleted_at IS NULL').get(configId, actor.id) as { template_id: string } | undefined;
+    if (!existing) return fail(reply, 409, 'Конфігурацію змінено або не знайдено.');
+    const json = configJson(body.data, existing.template_id); if (!json) return fail(reply, 422, 'Конфігурація завелика або пошкоджена.');
     const result = db.prepare('UPDATE configurations SET name=?,data_json=?,revision=revision+1,updated_at=? WHERE id=? AND owner_id=? AND revision=? AND deleted_at IS NULL')
-      .run(body.name, json, now(), (request.params as any).id, actor.id, revision);
+      .run(body.name, json, now(), configId, actor.id, revision);
     if (!result.changes) return fail(reply, 409, 'Конфігурацію змінено або не знайдено.');
-    return { id: (request.params as any).id, revision: revision + 1 };
+    return { id: configId, revision: revision + 1 };
   });
   app.delete('/api/v1/configurations/:id', async (request, reply) => {
     const actor = auth(request, reply, 'customer'); if (!actor) return;
@@ -538,7 +559,7 @@ export function buildApp({ db, origin, secureCookies = false, requireEmailVerifi
     return reply.code(204).send();
   });
 
-  const requestBody = z.object({ templateId: z.string().regex(/^[a-z0-9-]{1,60}$/), templateName: z.string().trim().min(1).max(80), configurationId: id.nullable().optional(), contact, note: z.string().trim().max(2000).default(''), features: z.array(feature).max(12).default([]), clientSubmissionId: id }).strict();
+  const requestBody = z.object({ templateId: z.string().regex(/^[a-z0-9-]{1,60}$/), templateName: z.string().trim().min(1).max(80), configurationId: id.nullable().optional(), configurationRevision: z.number().int().positive().optional(), contact, note: z.string().trim().max(2000).default(''), features: z.array(feature).max(12).default([]), clientSubmissionId: id }).strict();
   app.post('/api/v1/requests', async (request, reply) => {
     const actor = auth(request, reply, 'customer'); if (!actor || !verified(actor, reply)) return;
     const body = parse(requestBody, request.body, reply); if (!body) return;
@@ -550,8 +571,12 @@ export function buildApp({ db, origin, secureCookies = false, requireEmailVerifi
     }
     let snapshot: string | null = null;
     if (body.configurationId) {
-      const configuration = db.prepare('SELECT template_id,data_json FROM configurations WHERE id=? AND owner_id=? AND deleted_at IS NULL').get(body.configurationId, actor.id) as any;
+      const configuration = db.prepare('SELECT template_id,data_json,revision FROM configurations WHERE id=? AND owner_id=? AND deleted_at IS NULL')
+        .get(body.configurationId, actor.id) as { template_id: string; data_json: string; revision: number } | undefined;
       if (!configuration || configuration.template_id !== body.templateId) return fail(reply, 422, 'Конфігурація не належить цьому макету.');
+      if (body.configurationRevision !== undefined && configuration.revision !== body.configurationRevision) {
+        return fail(reply, 409, 'Конфігурацію змінено. Відкрийте її ще раз.');
+      }
       snapshot = configuration.data_json;
     }
     const requestId = randomUUID(), conversationId = randomUUID(), timestamp = now();
@@ -592,6 +617,18 @@ export function buildApp({ db, origin, secureCookies = false, requireEmailVerifi
     unreadCache.delete(actor.id);
     return reply.code(204).send();
   });
+  app.get('/api/v1/events', async (request, reply) => {
+    if (request.method !== 'GET') return reply.code(405).header('Allow', 'GET').send();
+    const actor = auth(request, reply); if (!actor) return;
+    const stream = chatEvents.subscribe(actor, () => {
+      const current = actorFromRequest(db, request);
+      return current?.id === actor.id && current.role === actor.role;
+    });
+    if (!stream) return reply.code(429).header('Retry-After', '30').send({ error: 'Забагато активних підключень.' });
+    return reply.header('Content-Type', 'text/event-stream; charset=utf-8')
+      .header('Cache-Control', 'private, no-store, no-transform')
+      .header('X-Accel-Buffering', 'no').send(stream);
+  });
   app.get('/api/v1/requests/:id/messages', async (request, reply) => {
     const actor = auth(request, reply); if (!actor) return;
     const row = requestRow((request.params as any).id, actor); if (!row) return fail(reply, 404, 'Не знайдено.');
@@ -629,8 +666,9 @@ export function buildApp({ db, origin, secureCookies = false, requireEmailVerifi
         .run(randomUUID(), row.customer_id, row.id, timestamp);
       return Number(result.lastInsertRowid);
     })();
-    if (notificationId) await deliverNotification(notificationId);
     unreadCache.clear();
+    chatEvents.publish(row.customer_id, { kind: 'message', requestId: row.id });
+    if (notificationId) await deliverNotification(notificationId);
     return reply.code(201).send({ id: messageId, senderId: actor.id, body: body.body, createdAt: timestamp });
   });
   app.patch('/api/v1/requests/:id/read', async (request, reply) => {
@@ -732,6 +770,7 @@ export function buildApp({ db, origin, secureCookies = false, requireEmailVerifi
         .run(randomUUID(), row.customer_id, row.id, body.status, now());
       audit(db, actor.id, 'request.status', 'request', row.id);
     })();
+    chatEvents.publish(row.customer_id, { kind: 'status', requestId: row.id });
     return { id: row.id, status: body.status, statusVersion: version + 1 };
   });
   app.post('/api/v1/admin/requests/:id/reopen', async (request, reply) => {
@@ -749,6 +788,7 @@ export function buildApp({ db, origin, secureCookies = false, requireEmailVerifi
         .run(randomUUID(), row.customer_id, row.id, now());
       audit(db, actor.id, 'request.reopen', 'request', row.id);
     })();
+    chatEvents.publish(row.customer_id, { kind: 'status', requestId: row.id });
     return { id: row.id, status: 'reviewing', statusVersion: version + 1 };
   });
   app.get('/api/v1/admin/audit', async (request, reply) => {
@@ -758,18 +798,26 @@ export function buildApp({ db, origin, secureCookies = false, requireEmailVerifi
   app.get('/api/v1/admin/guest-requests', async (request, reply) => {
     if (!auth(request, reply, 'admin')) return;
     const query = parse(page, request.query, reply); if (!query) return;
-    type GuestRow = { id: string; name: string; contact: string; features_json: string; budget: string; note: string; template_name: string | null; telegram_status: string; status: string; created_at: string; processed_at: string | null };
-    const rows = db.prepare(`SELECT id,name,contact,features_json,budget,note,template_name,telegram_status,status,created_at,processed_at
+    type GuestRow = { id: string; name: string; contact: string; features_json: string; budget: string; note: string; template_name: string | null; telegram_status: string; status: string; created_at: string; processed_at: string | null; has_trial: number };
+    const rows = db.prepare(`SELECT id,name,contact,features_json,budget,note,template_name,telegram_status,status,created_at,processed_at,trial_json IS NOT NULL AS has_trial
       FROM guest_requests ORDER BY created_at DESC,id DESC LIMIT ? OFFSET ?`).all(query.limit, query.offset) as GuestRow[];
-    const items = rows.map(({ features_json, template_name, telegram_status, created_at, processed_at, ...row }) => ({
+    const items = rows.map(({ features_json, template_name, telegram_status, created_at, processed_at, has_trial, ...row }) => ({
       ...row,
       features: JSON.parse(features_json) as string[],
       templateName: template_name,
       telegramStatus: telegram_status,
       createdAt: created_at,
       processedAt: processed_at,
+      hasTrial: Boolean(has_trial),
     }));
     return { items, nextOffset: items.length === query.limit ? query.offset + query.limit : null };
+  });
+  app.get('/api/v1/admin/guest-requests/:id/trial', async (request, reply) => {
+    if (!auth(request, reply, 'admin')) return;
+    const guestId = (request.params as { id: string }).id;
+    const row = db.prepare('SELECT trial_json FROM guest_requests WHERE id=?').get(guestId) as { trial_json: string | null } | undefined;
+    if (!row?.trial_json) return fail(reply, 404, 'Примірку не знайдено.');
+    return { trial: JSON.parse(row.trial_json) };
   });
   app.patch('/api/v1/admin/guest-requests/:id/status', async (request, reply) => {
     const actor = auth(request, reply, 'admin'); if (!actor) return;

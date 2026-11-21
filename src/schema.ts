@@ -131,4 +131,7 @@ export const MIGRATIONS = [
     );
     CREATE INDEX guest_requests_created ON guest_requests(created_at DESC, id DESC);
   ` },
+  { version: 7, sql: `
+    ALTER TABLE guest_requests ADD COLUMN trial_json TEXT;
+  ` },
 ] as const;

@@ -11,6 +11,7 @@ class Reply {
   sent = false;
 
   code(status: number) { this.statusCode = status; return this; }
+  hasHeader(name: string) { return Object.hasOwn(this.headers, name.toLowerCase()); }
   header(name: string, value: string) { this.headers[name.toLowerCase()] = value; return this; }
   send(payload?: unknown) { this.payload = payload; this.sent = true; return this; }
 }
@@ -77,6 +78,9 @@ export function createWorkerRouter(): FastifyInstance {
         }
       }
       for (const hook of hooks.onSend) await hook({ method: input.method, url: input.url, headers: {} }, reply);
+      if (reply.payload instanceof ReadableStream) {
+        return { statusCode: reply.statusCode, headers: reply.headers, rawPayload: Buffer.alloc(0), stream: reply.payload };
+      }
       const payload = reply.statusCode === 204 || reply.payload === undefined ? Buffer.alloc(0)
         : Buffer.from(typeof reply.payload === 'string' ? reply.payload : JSON.stringify(reply.payload));
       if (reply.payload !== undefined && typeof reply.payload !== 'string') reply.header('Content-Type', 'application/json; charset=utf-8');

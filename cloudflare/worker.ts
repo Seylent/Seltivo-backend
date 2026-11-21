@@ -240,7 +240,8 @@ export class SeltivoData extends DurableObject<Env> {
     headers.set('X-Request-Id', requestId);
     console.log(JSON.stringify({ event: 'api_request', requestId, method: request.method,
       status: result.statusCode, durationMs: Date.now() - started, databaseBytes: this.ctx.storage.sql.databaseSize }));
-    return new Response(result.statusCode === 204 ? null : new Uint8Array(result.rawPayload), { status: result.statusCode, headers });
+    const stream = (result as typeof result & { stream?: ReadableStream<Uint8Array> }).stream;
+    return new Response(stream ?? (result.statusCode === 204 ? null : new Uint8Array(result.rawPayload)), { status: result.statusCode, headers });
   }
 
   async alarm(): Promise<void> {

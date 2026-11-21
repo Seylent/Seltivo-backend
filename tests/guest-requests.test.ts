@@ -54,6 +54,27 @@ test('guest requests are stored, idempotent, visible to admins and can be proces
     assert.equal((await call(app, 'POST', '/api/v1/auth/register', { email: 'customer@example.test', password, name: 'Customer' })).status, 201);
     const customer = String((await app.inject({ method: 'POST', url: '/api/v1/auth/login', headers: { origin }, payload: { email: 'customer@example.test', password } })).headers['set-cookie']).split(';')[0];
     assert.equal((await call(app, 'GET', '/api/v1/admin/guest-requests', undefined, customer)).status, 403);
+
+    const trialId = randomUUID();
+    const trial = {
+      version: 1, templateId: 'noir', changes: [
+        { id: 'hero.title', kind: 'text', label: 'Заголовок', value: 'Портфоліо' },
+        { id: 'card.forma.image', kind: 'image', label: 'Forma', value: 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+ZMeQAAAAASUVORK5CYII=' },
+      ],
+    };
+    const studio = { ...brief, id: trialId, features: [], note: '', templateName: 'NOIR', telegramStatus: 'failed', trial };
+    const detailPath = `/api/v1/admin/guest-requests/${trialId}/trial`;
+    assert.equal((await call(app, 'POST', '/api/v1/guest-requests', studio)).status, 201);
+    assert.equal((await call(app, 'POST', '/api/v1/guest-requests', { ...studio, telegramStatus: 'sent' })).status, 200);
+    assert.equal((await call(app, 'POST', '/api/v1/guest-requests', { ...studio, note: 'Different' })).status, 409);
+    const inbox = await call(app, 'GET', '/api/v1/admin/guest-requests', undefined, cookie);
+    const entry = inbox.body.items.find((item: { id: string }) => item.id === trialId);
+    assert.equal(entry.hasTrial, true);
+    assert.equal(entry.telegramStatus, 'sent');
+    assert.equal('trial' in entry, false);
+    assert.deepEqual((await call(app, 'GET', detailPath, undefined, cookie)).body.trial, trial);
+    assert.equal((await call(app, 'GET', detailPath, undefined, customer)).status, 403);
+    assert.equal((await call(app, 'GET', detailPath)).status, 401);
   } finally {
     await app.close();
     db.close();
