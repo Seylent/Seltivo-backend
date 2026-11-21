@@ -723,6 +723,20 @@ export function buildApp({ db, origin, secureCookies = false, requireEmailVerifi
     db.prepare('DELETE FROM notifications WHERE read_at IS NOT NULL AND read_at<?').run(retentionCutoff);
     return reply.code(204).send();
   });
+  app.delete('/api/v1/notifications/:id', async (request, reply) => {
+    const actor = auth(request, reply, 'customer'); if (!actor) return;
+    const notificationId = (request.params as { id: string }).id;
+    const result = db.prepare('DELETE FROM notifications WHERE id=? AND recipient_id=?').run(notificationId, actor.id);
+    if (result.changes === 0) return fail(reply, 404, 'Не знайдено.');
+    unreadCache.delete(actor.id);
+    return reply.code(204).send();
+  });
+  app.delete('/api/v1/notifications', async (request, reply) => {
+    const actor = auth(request, reply, 'customer'); if (!actor) return;
+    db.prepare('DELETE FROM notifications WHERE recipient_id=?').run(actor.id);
+    unreadCache.delete(actor.id);
+    return reply.code(204).send();
+  });
 
   app.get('/api/v1/admin/customers', async (request, reply) => {
     if (!auth(request, reply, 'admin')) return;
@@ -856,6 +870,16 @@ export function buildApp({ db, origin, secureCookies = false, requireEmailVerifi
       JOIN messages m ON m.conversation_id=c.id AND m.sender_id<>?
       LEFT JOIN conversation_reads cr ON cr.conversation_id=c.id AND cr.user_id=?
       WHERE m.id>COALESCE(cr.last_read_message_id,0)`).get(actor.id, actor.id) as { total: number | null };
+    const waitingAccount = db.prepare(`SELECT r.id,r.template_name templateName,u.name customerName,COUNT(*) OVER () total,
+      COALESCE((SELECT m.created_at FROM messages m JOIN users sender ON sender.id=m.sender_id
+        WHERE m.conversation_id=c.id AND sender.role='customer' ORDER BY m.id DESC LIMIT 1),r.created_at) waitingSince
+      FROM requests r JOIN users u ON u.id=r.customer_id JOIN conversations c ON c.request_id=r.id
+      WHERE r.status NOT IN ('completed','cancelled')
+        AND COALESCE((SELECT sender.role FROM messages m JOIN users sender ON sender.id=m.sender_id
+          WHERE m.conversation_id=c.id ORDER BY m.id DESC LIMIT 1),'customer')='customer'
+      ORDER BY waitingSince ASC,r.id ASC LIMIT 5`).all() as Array<{ id: string; templateName: string; customerName: string; waitingSince: string; total: number }>;
+    const waitingGuest = db.prepare(`SELECT id,name customerName,template_name templateName,created_at waitingSince,COUNT(*) OVER () total
+      FROM guest_requests WHERE status='new' ORDER BY created_at ASC,id ASC LIMIT 5`).all() as Array<{ id: string; templateName: string | null; customerName: string; waitingSince: string; total: number }>;
     const emailProblems = (db.prepare("SELECT COUNT(*) count FROM email_notifications WHERE status IN ('pending','failed')").get() as { count: number }).count;
     const integrity = db.pragma('quick_check', { simple: true });
     const foreignKeys = (db.pragma('foreign_key_check') as unknown[]).length;
@@ -873,6 +897,10 @@ export function buildApp({ db, origin, secureCookies = false, requireEmailVerifi
       },
       customers: { total: number(customers.total), last7Days: number(customers.last7Days) },
       messages: { unread: number(unread.total) },
+      waitingRepliesCount: (waitingAccount[0]?.total ?? 0) + (waitingGuest[0]?.total ?? 0),
+      waitingReplies: [...waitingAccount.map(({ total: _total, ...item }) => ({ ...item, kind: 'account' as const })),
+        ...waitingGuest.map(({ total: _total, ...item }) => ({ ...item, kind: 'guest' as const }))]
+        .sort((a, b) => a.waitingSince.localeCompare(b.waitingSince)).slice(0, 5),
       email: { problems: emailProblems },
       system: { ok: integrity === 'ok' && foreignKeys === 0, integrity, foreignKeyViolations: foreignKeys,
         databaseBytes: databaseBytes?.() ?? null, emailConfigured: Boolean(sendMail) },

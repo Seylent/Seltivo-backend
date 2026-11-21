@@ -101,6 +101,17 @@ test('registration, ownership, idempotent requests, chat and admin status', asyn
     assert.equal(reopened.body.statusVersion, 5);
     assert.equal((await call('GET', `/api/v1/requests/${first.body.id}`, undefined, alice)).body.events.length, 5);
     assert.equal((await call('GET', '/api/v1/notifications', undefined, alice)).body.unread, 3);
+    // Користувач може видалити одне сповіщення або очистити все одразу.
+    const notificationsBeforeDelete = await call('GET', '/api/v1/notifications', undefined, alice);
+    const notificationId = notificationsBeforeDelete.body.items[0].id as string;
+    assert.equal((await call('DELETE', `/api/v1/notifications/${notificationId}`, undefined, bob)).status, 404);
+    assert.equal((await call('DELETE', `/api/v1/notifications/${notificationId}`, undefined, alice)).status, 204);
+    assert.equal((await call('DELETE', `/api/v1/notifications/${notificationId}`, undefined, alice)).status, 404);
+    assert.equal((await call('DELETE', '/api/v1/notifications', undefined, admin)).status, 403);
+    assert.equal((await call('DELETE', '/api/v1/notifications', undefined, alice)).status, 204);
+    const notificationsAfterDelete = await call('GET', '/api/v1/notifications', undefined, alice);
+    assert.equal(notificationsAfterDelete.body.unread, 0);
+    assert.equal(notificationsAfterDelete.body.items.length, 0);
     const auditLog = await call('GET', '/api/v1/admin/audit', undefined, admin);
     assert.equal(auditLog.status, 200);
     assert.ok(auditLog.body.items.some((item: { action: string }) => item.action === 'request.reopen'));

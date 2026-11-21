@@ -45,7 +45,7 @@ Remove-Item Env:SELTIVO_ADMIN_PASSWORD
 | Профіль | `GET/PATCH/DELETE /me` |
 | Збережені конфігурації | `GET/POST /configurations`, `GET/PATCH/DELETE /configurations/:id` |
 | Заявки | `GET/POST /requests`, `GET /requests/:id` |
-| Чат та сповіщення | `GET/POST /requests/:id/messages`, `PATCH /requests/:id/read`, `GET /notifications/unread-count`, `GET /notifications`, `PATCH /notifications/requests/:id/read` |
+| Чат та сповіщення | `GET/POST /requests/:id/messages`, `PATCH /requests/:id/read`, `GET /notifications/unread-count`, `GET /notifications`, `PATCH /notifications/requests/:id/read`, `DELETE /notifications/:id`, `DELETE /notifications` (очистити все; лише власні сповіщення) |
 | Адміністратор | `GET /admin/customers`, `GET /admin/customers/:id` (з заявками, конфігураціями й лічильниками), `GET /admin/requests`, `PATCH /admin/requests/:id/status`, `POST /admin/requests/:id/reopen`, `GET /admin/email-notifications`, `POST /admin/email-notifications/:id/retry`, `GET /admin/overview` (метрики для дашборду), `GET /admin/diagnostics`, `GET /admin/audit` |
 | Гостьові заявки | `POST /guest-requests` (публічний, ідемпотентний за `id`), `GET /admin/guest-requests`, `PATCH /admin/guest-requests/:id/status` (`new`/`in_progress`/`done`) |
 | 2FA адміна | `GET /auth/2fa/status`, `POST /auth/2fa/setup` (потрібен пароль), `POST /auth/2fa/enable` (код TOTP), `POST /auth/2fa/disable` (пароль + код); у `POST /auth/login` поле `code` обов'язкове, коли 2FA увімкнено (код відновлення теж приймається один раз) |
