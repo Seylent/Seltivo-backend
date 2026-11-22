@@ -6,6 +6,7 @@ import { actorFromRequest, audit, clearSessionCookie, createSession, hashPasswor
 import { generateRecoveryCodes, generateTotpSecret, normalizeRecoveryCode, otpauthUri, verifyTotp } from './two-factor.js';
 import { trialSnapshot } from './trial.js';
 import { createChatEvents } from './chat-events.js';
+import { retention } from './retention.js';
 import { accountExport } from './account-export.js';
 import { accountBytes, dataLimits as resolveDataLimits, type DataLimits } from './data-limits.js';
 import { renderEmail } from './emails.js';
@@ -940,6 +941,14 @@ export function buildApp({ dataLimits, db, origin, secureCookies = false, requir
     })();
     chatEvents.publish(row.customer_id, { kind: 'status', requestId: row.id });
     return { id: row.id, status: 'reviewing', statusVersion: version + 1 };
+  });
+  app.post('/api/v1/admin/retention', async (request, reply) => {
+    const actor = auth(request, reply, 'admin'); if (!actor) return;
+    const body = parse(z.object({ before: z.iso.datetime(), apply: z.boolean().default(false) }).strict(), request.body, reply); if (!body) return;
+    if (Date.parse(body.before) > Date.now() - 30 * 86400000) return fail(reply, 422, 'Дата очищення має бути щонайменше 30 днів тому.');
+    const result = retention(db, body.before, body.apply);
+    if (body.apply) audit(db, actor.id, 'data.retention', 'policy', body.before);
+    return result;
   });
   app.get('/api/v1/admin/audit', async (request, reply) => {
     if (!auth(request, reply, 'admin')) return;
