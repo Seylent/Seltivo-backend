@@ -34,7 +34,7 @@ function stagingControlsEnabled(env: Env): boolean {
 
 function brevoMail(env: Env) {
   if (!env.BREVO_API_KEY || !env.BREVO_SENDER_EMAIL) return undefined;
-  return async (to: string, subject: string, text: string) => {
+  return async (to: string, subject: string, text: string, html?: string) => {
     const response = await fetch('https://api.brevo.com/v3/smtp/email', {
       method: 'POST',
       signal: AbortSignal.timeout(15_000),
@@ -44,6 +44,7 @@ function brevoMail(env: Env) {
         to: [{ email: to }],
         subject,
         textContent: text,
+        ...(html ? { htmlContent: html } : {}),
       }),
     });
     if (!response.ok) throw new Error(`Brevo email failed with status ${response.status}`);

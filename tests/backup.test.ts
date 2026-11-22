@@ -79,14 +79,14 @@ test('a restored backup supports login, requests and chat in an isolated staging
       assert.equal(restoredRequest.json().note, 'Restore drill');
       const messages = await stagingApp.inject({ method: 'GET', url: `/api/v1/requests/${requestId}/messages`, headers: { cookie: restoredCookie } });
       assert.equal(messages.statusCode, 200);
-      assert.equal(messages.json().items[0].body, 'Before backup');
+      assert.equal(messages.json().items[1].body, 'Before backup');
       const adminLogin = await stagingApp.inject({ method: 'POST', url: '/api/v1/auth/login', headers: { origin }, payload: { email: 'admin@example.test', password } });
       assert.equal(adminLogin.statusCode, 200);
       const adminCookie = String(adminLogin.headers['set-cookie']).split(';')[0];
       const reply = await stagingApp.inject({ method: 'POST', url: `/api/v1/requests/${requestId}/messages`, headers: { origin, cookie: adminCookie }, payload: { body: 'After restore', clientMessageId: randomUUID() } });
       assert.equal(reply.statusCode, 201);
       const conversation = await stagingApp.inject({ method: 'GET', url: `/api/v1/requests/${requestId}/messages`, headers: { cookie: restoredCookie } });
-      assert.deepEqual(conversation.json().items.map((message: { body: string }) => message.body), ['Before backup', 'Привіт, менеджер скоро відповість вам', 'After restore']);
+      assert.deepEqual(conversation.json().items.map((message: { body: string }) => message.body), ['Привіт, менеджер скоро відповість вам', 'Before backup', 'After restore']);
     } finally { await stagingApp.close(); staging.close(); }
   } finally {
     if (source.open) { await app.close(); source.close(); }

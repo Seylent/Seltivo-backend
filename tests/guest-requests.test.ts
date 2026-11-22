@@ -23,6 +23,11 @@ test('guest requests are stored, idempotent, visible to admins and can be proces
     assert.equal((await call(app, 'POST', '/api/v1/guest-requests', brief)).status, 201);
     // Повтор з тим самим ID (наприклад, retry після таймауту) не створює копію.
     assert.equal((await call(app, 'POST', '/api/v1/guest-requests', brief)).status, 200);
+    assert.equal((await call(app, 'POST', '/api/v1/guest-requests', { ...brief, note: 'Changed after retry' })).status, 409);
+    const withoutTemplate = { ...brief, id: randomUUID(), templateName: undefined, telegramStatus: 'failed' };
+    assert.equal((await call(app, 'POST', '/api/v1/guest-requests', withoutTemplate)).status, 201);
+    assert.equal((await call(app, 'POST', '/api/v1/guest-requests', { ...withoutTemplate, telegramStatus: 'sent' })).status, 200);
+    db.prepare('DELETE FROM guest_requests WHERE id=?').run(withoutTemplate.id);
     assert.equal((db.prepare('SELECT COUNT(*) count FROM guest_requests').get() as { count: number }).count, 1);
     assert.equal((await call(app, 'POST', '/api/v1/guest-requests', { ...brief, id: randomUUID(), name: 'Х' })).status, 422);
 

@@ -6,10 +6,11 @@ import { actorFromRequest, audit, clearSessionCookie, createSession, hashPasswor
 import { generateRecoveryCodes, generateTotpSecret, normalizeRecoveryCode, otpauthUri, verifyTotp } from './two-factor.js';
 import { trialSnapshot } from './trial.js';
 import { createChatEvents } from './chat-events.js';
+import { renderEmail } from './emails.js';
 
 const id = z.uuid();
 const email = z.email().max(254);
-const password = z.string().min(12).max(200);
+const password = z.string().min(6).max(200);
 const contact = z.object({ name: z.string().trim().min(2).max(60), email: email.optional(), phone: z.string().trim().max(40).optional(), telegram: z.string().trim().max(80).optional() }).strict();
 const guestRequest = z.object({
   id,
@@ -39,7 +40,7 @@ const transitions: Record<Status, Status[]> = {
 };
 const fail = (reply: FastifyReply, status: number, error: string) => reply.code(status).send({ error });
 
-type Mail = (to: string, subject: string, text: string) => Promise<void>;
+type Mail = (to: string, subject: string, text: string, html?: string) => Promise<void>;
 export type AppOptions = { db: SeltivoDb; origin: string; secureCookies?: boolean; requireEmailVerification?: boolean; requireAdmin2FA?: boolean; sendMail?: Mail; teamEmail?: string; databaseBytes?: () => number; deleteCustomer?: (userId: string) => Promise<void>; logger?: boolean; router?: FastifyInstance };
 const MAX_CONFIGURATIONS_PER_USER = 50;
 /** Автовідповідь у чаті, поки менеджер ще не відповів особисто. Мова = мова інтерфейсу клієнта. */
@@ -58,6 +59,13 @@ function localeFromRequest(request: FastifyRequest): Locale | null {
   const raw = request.headers.cookie?.split(';').map((part) => part.trim()).find((part) => part.startsWith(`${LOCALE_COOKIE}=`));
   const value = raw?.slice(LOCALE_COOKIE.length + 1);
   return isLocale(value) ? value : null;
+}
+/** Пише автовідповідь від першого активного менеджера. Фіксований ключ на заявку дає рівно одне повідомлення. */
+function insertChatAutoReply(db: SeltivoDb, conversationId: string, requestId: string, locale: Locale | null, timestamp: string): boolean {
+  const sender = db.prepare("SELECT id FROM users WHERE role='admin' AND disabled_at IS NULL ORDER BY created_at ASC LIMIT 1").get() as { id: string } | undefined;
+  if (!sender) return false;
+  return db.prepare('INSERT OR IGNORE INTO messages(conversation_id,sender_id,client_message_id,body,created_at) VALUES (?,?,?,?,?)')
+    .run(conversationId, sender.id, `${AUTOREPLY_KEY_PREFIX}${requestId}`, CHAT_AUTOREPLY[locale ?? 'uk'], timestamp).changes > 0;
 }
 const RETENTION_MS = 30 * 24 * 60 * 60 * 1000;
 const PNG_SIGNATURE = Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]);
@@ -172,9 +180,9 @@ export function buildApp({ db, origin, secureCookies = false, requireEmailVerifi
     return null;
   };
   const unreadCache = new Map<string, { value: unknown; expires: number }>();
-  const mail = async (to: string, subject: string, text: string) => {
+  const mail = async (to: string, subject: string, text: string, html?: string) => {
     if (!sendMail) return false;
-    try { await sendMail(to, subject, text); return true; } catch { app.log.error({ event: 'email_delivery_failed', kind: 'auth' }); return false; }
+    try { await sendMail(to, subject, text, html); return true; } catch { app.log.error({ event: 'email_delivery_failed', kind: 'auth' }); return false; }
   };
   const deliverNotification = async (notificationId: string): Promise<'sent' | 'failed' | 'busy' | 'missing'> => {
     const started = now();
@@ -185,17 +193,22 @@ export function buildApp({ db, origin, secureCookies = false, requireEmailVerifi
       const row = db.prepare('SELECT status FROM email_notifications WHERE id=?').get(notificationId) as { status: string } | undefined;
       return row ? 'busy' : 'missing';
     }
-    const row = db.prepare(`SELECT n.recipient,r.id request_id,u.role sender_role FROM email_notifications n
+    const row = db.prepare(`SELECT n.recipient,r.id request_id,u.role sender_role,
+      (SELECT locale FROM users WHERE email=n.recipient) AS recipient_locale FROM email_notifications n
       JOIN messages m ON m.id=n.message_id JOIN users u ON u.id=m.sender_id
       JOIN conversations c ON c.id=m.conversation_id JOIN requests r ON r.id=c.request_id WHERE n.id=?`)
-      .get(notificationId) as { recipient: string; request_id: string; sender_role: string } | undefined;
+      .get(notificationId) as { recipient: string; request_id: string; sender_role: string; recipient_locale: string | null } | undefined;
     if (!row) return 'missing';
     const customer = row.sender_role === 'admin';
-    const subject = customer ? 'Нова відповідь SELTIVO' : 'Нове повідомлення клієнта SELTIVO';
-    const text = `${customer ? 'Нова відповідь' : 'Нове повідомлення'} у заявці ${row.request_id}: ${origin}/${customer ? 'account' : 'admin'}/requests/${row.request_id}`;
+    const message = renderEmail('chat-message', {
+      origin,
+      requestId: row.request_id,
+      customerReply: customer,
+      url: `${origin}/${customer ? 'account' : 'admin'}/requests/${row.request_id}`,
+    }, row.recipient_locale);
     try {
       if (!sendMail) throw new Error('mail_not_configured');
-      await sendMail(row.recipient, subject, text);
+      await sendMail(row.recipient, message.subject, message.text, message.html);
       const sentAt = now();
       const retentionCutoff = new Date(Date.now() - RETENTION_MS).toISOString();
       db.prepare("UPDATE email_notifications SET status='sent',sent_at=?,last_error_code=NULL WHERE id=?").run(sentAt, notificationId);
@@ -298,7 +311,8 @@ export function buildApp({ db, origin, secureCookies = false, requireEmailVerifi
     }
     if (requireEmailVerification && sendMail) {
       const code = newEmailCode(db, userId);
-      await mail(normalized, 'Код підтвердження SELTIVO', `Ваш код підтвердження SELTIVO: ${code}\n\nКод дійсний 10 хвилин. Якщо ви не створювали акаунт, проігноруйте цей лист.`);
+      const message = renderEmail('verification', { origin, code }, localeFromRequest(request));
+      await mail(normalized, message.subject, message.text, message.html);
     }
     return reply.code(201).send({ id: userId, verificationRequired: requireEmailVerification });
   });
@@ -314,7 +328,8 @@ export function buildApp({ db, origin, secureCookies = false, requireEmailVerifi
     const user = db.prepare('SELECT id,email,email_verified_at FROM users WHERE email=? AND disabled_at IS NULL').get(normalized) as any;
     if (user && !user.email_verified_at && sendMail) {
       const code = newEmailCode(db, user.id);
-      await mail(user.email, 'Код підтвердження SELTIVO', `Ваш новий код підтвердження SELTIVO: ${code}\n\nКод дійсний 10 хвилин. Якщо ви не створювали акаунт, проігноруйте цей лист.`);
+      const message = renderEmail('verification', { origin, code }, localeFromRequest(request));
+      await mail(user.email, message.subject, message.text, message.html);
     }
     return reply.code(202).send({ ok: true });
   });
@@ -346,7 +361,7 @@ export function buildApp({ db, origin, secureCookies = false, requireEmailVerifi
     return { ok: true };
   });
   // Гостьові заявки з публічних форм: зберігаємо копію для адмінки.
-  // Telegram-доставку виконує Next-route; сюди приходить уже знаний результат.
+  // Next-route спочатку зберігає заявку, потім оновлює результат доставки.
   app.post('/api/v1/guest-requests', async (request, reply) => {
     const body = parse(guestRequest, request.body, reply); if (!body) return;
     const trial = body.trial ? JSON.stringify(body.trial) : null;
@@ -356,10 +371,10 @@ export function buildApp({ db, origin, secureCookies = false, requireEmailVerifi
       VALUES (?,?,?,?,?,?,?,?,'new',?,?)`)
       .run(body.id, body.name, body.contact, features, body.budget, body.note,
         body.templateName ?? null, body.telegramStatus, now(), trial);
-    if (!stored.changes && trial) {
+    if (!stored.changes) {
       const same = db.prepare(`SELECT id FROM guest_requests WHERE id=? AND name=? AND contact=? AND features_json=?
-        AND budget=? AND note=? AND template_name=? AND trial_json=?`)
-        .get(body.id, body.name, body.contact, features, body.budget, body.note, body.templateName, trial);
+        AND budget=? AND note=? AND template_name IS ? AND trial_json IS ?`)
+        .get(body.id, body.name, body.contact, features, body.budget, body.note, body.templateName ?? null, trial);
       if (!same) return fail(reply, 409, 'Ключ повтору вже використано.');
       if (body.telegramStatus === 'sent') db.prepare("UPDATE guest_requests SET telegram_status='sent' WHERE id=?").run(body.id);
     }
@@ -384,7 +399,8 @@ export function buildApp({ db, origin, secureCookies = false, requireEmailVerifi
         if (!checkRateLimit(limitKey, 15 * 60_000, 5, reply, false)) return;
         recordAttempt(limitKey, 15 * 60_000);
         const verificationCode = newEmailCode(db, user.id);
-        const sent = await mail(user.email, 'Код підтвердження SELTIVO', `Ваш код підтвердження SELTIVO: ${verificationCode}\n\nКод дійсний 10 хвилин. Якщо ви не створювали акаунт, проігноруйте цей лист.`);
+        const message = renderEmail('verification', { origin, code: verificationCode }, localeFromRequest(request));
+        const sent = await mail(user.email, message.subject, message.text, message.html);
         if (!sent) return fail(reply, 503, 'Не вдалося надіслати код. Спробуйте ще раз на сторінці підтвердження.');
       }
       return fail(reply, 403, 'Підтвердьте email кодом із листа. Якщо листа немає, надішліть код ще раз.');
@@ -501,7 +517,8 @@ export function buildApp({ db, origin, secureCookies = false, requireEmailVerifi
     const user = db.prepare('SELECT id,email FROM users WHERE email=? AND disabled_at IS NULL').get(normalized) as any;
     if (user && sendMail) {
       const token = newAuthToken(db, user.id, 'reset', 30 * 60 * 1000);
-      await mail(user.email, 'Відновлення пароля SELTIVO', `${origin}/reset-password?token=${token}`);
+      const message = renderEmail('reset-password', { origin, url: `${origin}/reset-password?token=${token}` }, localeFromRequest(request));
+      await mail(user.email, message.subject, message.text, message.html);
     } else if (user) app.log.error({ event: 'email_delivery_failed', kind: 'auth', code: 'mail_not_configured' });
     return reply.code(202).send({ ok: true });
   });
@@ -627,15 +644,26 @@ export function buildApp({ db, origin, secureCookies = false, requireEmailVerifi
       snapshot = configuration.data_json;
     }
     const requestId = randomUUID(), conversationId = randomUUID(), timestamp = now();
-    db.transaction(() => {
+    // Мова клієнта = мова його інтерфейсу (cookie), інакше останнє збережене значення.
+    // Зберігаємо її одразу, щоб вітальне повідомлення було тією ж мовою.
+    const cookieLocale = localeFromRequest(request);
+    const savedLocale = (db.prepare('SELECT locale FROM users WHERE id=?').get(actor.id) as { locale: string | null } | undefined)?.locale;
+    const locale: Locale | null = cookieLocale ?? (isLocale(savedLocale) ? savedLocale : null);
+    if (cookieLocale) db.prepare('UPDATE users SET locale=? WHERE id=?').run(cookieLocale, actor.id);
+    const greeted = db.transaction(() => {
       db.prepare(`INSERT INTO requests(id,customer_id,template_id,template_name,configuration_id,config_snapshot_json,contact_json,note,features_json,client_submission_id,status,created_at,updated_at)
         VALUES (?,?,?,?,?,?,?,?,?,?,'submitted',?,?)`).run(requestId, actor.id, body.templateId, body.templateName, body.configurationId ?? null, snapshot, JSON.stringify(body.contact), body.note, JSON.stringify(body.features), body.clientSubmissionId, timestamp, timestamp);
       db.prepare('INSERT INTO conversations(id,request_id,created_at) VALUES (?,?,?)').run(conversationId, requestId, timestamp);
+      // Перше повідомлення в чаті з'являється одразу після створення заявки —
+      // клієнту не потрібно спочатку писати першому, щоб побачити відповідь.
+      const inserted = insertChatAutoReply(db, conversationId, requestId, locale, timestamp);
       db.prepare('INSERT INTO request_events(id,request_id,actor_id,old_status,new_status,reason,created_at) VALUES (?,?,?,NULL,?,?,?)').run(randomUUID(), requestId, actor.id, 'submitted', '', timestamp);
       audit(db, actor.id, 'request.created', 'request', requestId);
+      return inserted;
     })();
-    // Нова заявка — це не повідомлення чату, але адміни мають бачити її одразу.
+    // Адміни бачать нову заявку, клієнт — перше повідомлення в діалозі одразу.
     chatEvents.publish(actor.id, { kind: 'request', requestId });
+    if (greeted) chatEvents.publish(actor.id, { kind: 'message', requestId });
     return reply.code(201).send({ id: requestId, status: 'submitted', conversationId });
   });
   app.get('/api/v1/requests', async (request, reply) => {
@@ -714,20 +742,16 @@ export function buildApp({ db, origin, secureCookies = false, requireEmailVerifi
       locale = cookieLocale ?? (isLocale(saved) ? saved : null);
       if (cookieLocale) db.prepare('UPDATE users SET locale=? WHERE id=?').run(cookieLocale, actor.id);
     }
-    // Пишемо автовідповідь від імені менеджера — так це звичайне повідомлення в
-    // діалозі, яке бачать обидва, і одразу йде клієнту через SSE. Фіксований ключ
-    // на заявку дає рівно одну автовідповідь, повтори надсилання її не дублюють.
-    const autoReplySender = actor.role === 'customer'
-      ? (db.prepare("SELECT id FROM users WHERE role='admin' AND disabled_at IS NULL ORDER BY created_at ASC LIMIT 1").get() as { id: string } | undefined)
-      : undefined;
+    // Для старих заявок, де вітального повідомлення ще немає, воно з'являється
+    // на перше звернення клієнта. Фіксований ключ не дає дублювати його.
+    const insertAutoReply = actor.role === 'customer';
     const recipient = actor.role === 'admin'
       ? (db.prepare('SELECT email FROM users WHERE id=?').get(row.customer_id) as { email: string }).email
       : teamEmail;
     const notificationId = recipient ? randomUUID() : null;
     const messageId = db.transaction(() => {
       const result = db.prepare('INSERT INTO messages(conversation_id,sender_id,client_message_id,body,created_at) VALUES (?,?,?,?,?)').run(row.conversation_id, actor.id, body.clientMessageId, body.body, timestamp);
-      if (autoReplySender) db.prepare('INSERT OR IGNORE INTO messages(conversation_id,sender_id,client_message_id,body,created_at) VALUES (?,?,?,?,?)')
-        .run(row.conversation_id, autoReplySender.id, `${AUTOREPLY_KEY_PREFIX}${row.id}`, CHAT_AUTOREPLY[locale ?? 'uk'], timestamp);
+      if (insertAutoReply) insertChatAutoReply(db, row.conversation_id, row.id, locale, timestamp);
       if (recipient && notificationId) db.prepare(`INSERT INTO email_notifications(id,message_id,recipient,status,created_at)
         VALUES (?,?,?,'pending',?)`).run(notificationId, Number(result.lastInsertRowid), recipient, timestamp);
       if (actor.role === 'admin') db.prepare('INSERT INTO notifications(id,recipient_id,request_id,kind,status,created_at) VALUES (?,?,?,\'message\',NULL,?)')
@@ -748,6 +772,10 @@ export function buildApp({ db, origin, secureCookies = false, requireEmailVerifi
       ON CONFLICT(conversation_id,user_id) DO UPDATE SET last_read_message_id=MAX(last_read_message_id,excluded.last_read_message_id),read_at=excluded.read_at`)
       .run(row.conversation_id, actor.id, body.lastSeenMessageId, now());
     unreadCache.delete(actor.id);
+    // Сповіщаємо співрозмовника: його власні повідомлення тепер мають
+    // подвійну галочку. Без цієї події стан readByRecipient оновлювався
+    // лише після повного перезавантаження чату.
+    chatEvents.publish(row.customer_id, { kind: 'read', requestId: row.id });
     return reply.code(204).send();
   });
   app.get('/api/v1/notifications/unread-count', async (request, reply) => {

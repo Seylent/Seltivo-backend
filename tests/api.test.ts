@@ -154,13 +154,17 @@ test('a customer gets exactly one auto-reply in chat, without emails or notifica
     const config = await call('POST', '/api/v1/configurations', { templateId: 'fashion-01', name: 'Мій сайт', data: { id: 'brand', name: 'Brand', colors: {}, hero: {}, home: {}, products: [] } }, customer);
     const request = await call('POST', '/api/v1/requests', { templateId: 'fashion-01', templateName: 'Fashion 01', configurationId: config.body.id, contact: { name: 'Customer' }, note: '', features: [], clientSubmissionId: randomUUID() }, customer);
     const url = `/api/v1/requests/${request.body.id}/messages`;
+    // Вітальне повідомлення в чаті є одразу після створення заявки, ще до листа клієнта.
+    const initial = (await call('GET', url, undefined, customer)).body.items;
+    assert.deepEqual(initial.map((message: { body: string }) => message.body), [autoReply]);
+    assert.equal(initial[0].senderId, adminId);
     const key = randomUUID();
     const first = await call('POST', url, { body: 'Перше питання', clientMessageId: key }, customer);
     assert.equal(first.status, 201);
     let items = (await call('GET', url, undefined, customer)).body.items;
     assert.equal(items.length, 2);
-    assert.equal(items[1].body, autoReply);
-    assert.equal(items[1].senderId, adminId);
+    assert.equal(items[0].body, autoReply);
+    assert.equal(items[1].body, 'Перше питання');
     assert.equal(sent.length, 1); // автовідповідь листа не надсилає
 
     assert.equal((await call('POST', url, { body: 'Перше питання', clientMessageId: key }, customer)).status, 200);
@@ -198,10 +202,13 @@ test('auto-reply uses the chat language and managers can see the customer langua
     const config = await call('POST', '/api/v1/configurations', { templateId: 'fashion-01', name: 'My site', data: { id: 'brand', name: 'Brand', colors: {}, hero: {}, home: {}, products: [] } }, englishCookie);
     const request = await call('POST', '/api/v1/requests', { templateId: 'fashion-01', templateName: 'Fashion 01', configurationId: config.body.id, contact: { name: 'English Customer' }, note: '', features: [], clientSubmissionId: randomUUID() }, englishCookie);
     const url = `/api/v1/requests/${request.body.id}/messages`;
+    // Мова вітального повідомлення визначається ще на етапі створення заявки.
+    assert.equal((await call('GET', url, undefined, englishCookie)).body.items[0].body, 'Hi! A manager will get back to you shortly');
     assert.equal((await call('POST', url, { body: 'Hello', clientMessageId: randomUUID() }, englishCookie)).status, 201);
 
     const items = (await call('GET', url, undefined, englishCookie)).body.items;
-    assert.equal(items[1].body, 'Hi! A manager will get back to you shortly');
+    assert.equal(items[0].body, 'Hi! A manager will get back to you shortly');
+    assert.equal(items[1].body, 'Hello');
     assert.equal((await call('GET', '/api/v1/me', undefined, englishCookie)).body.locale, 'en');
 
     // Менеджер бачить мову клієнта в заявці, списку заявок і картці клієнта.
@@ -354,5 +361,22 @@ test('login sends a code to an existing customer who needs to verify', async () 
     assert.ok(code);
     assert.equal((await call('/api/v1/auth/verify-email', { email, code })).statusCode, 200);
     assert.equal((await call('/api/v1/auth/login', { email, password: 'InitialPassword123!' })).statusCode, 200);
+  } finally { db.close(); }
+});
+
+test('password policy accepts six characters and rejects five', async () => {
+  const db = openDatabase(':memory:');
+  const app = buildApp({ db, origin, logger: false });
+  const call = (url: string, payload: unknown, cookie?: string) => app.inject({ method: 'POST', url, headers: { origin, ...(cookie ? { cookie } : {}) }, payload });
+  try {
+    assert.equal((await call('/api/v1/auth/register', { email: 'six@example.test', password: '123456', name: 'Six' })).statusCode, 201);
+    assert.equal((await call('/api/v1/auth/register', { email: 'five@example.test', password: '12345', name: 'Five' })).statusCode, 422);
+    const login = await call('/api/v1/auth/login', { email: 'six@example.test', password: '123456' });
+    assert.equal(login.statusCode, 200);
+    const cookie = login.headers['set-cookie'] as string | undefined;
+    assert.equal((await call('/api/v1/auth/change-password', { currentPassword: '123456', newPassword: '654321' }, cookie)).statusCode, 200);
+    const nextLogin = await call('/api/v1/auth/login', { email: 'six@example.test', password: '654321' });
+    assert.equal(nextLogin.statusCode, 200);
+    assert.equal((await call('/api/v1/auth/change-password', { currentPassword: '654321', newPassword: '12345' }, nextLogin.headers['set-cookie'] as string | undefined)).statusCode, 422);
   } finally { db.close(); }
 });
