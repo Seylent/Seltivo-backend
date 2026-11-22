@@ -7,6 +7,7 @@ import { generateRecoveryCodes, generateTotpSecret, normalizeRecoveryCode, otpau
 import { trialSnapshot } from './trial.js';
 import { createChatEvents } from './chat-events.js';
 import { accountExport } from './account-export.js';
+import { accountBytes, dataLimits as resolveDataLimits, type DataLimits } from './data-limits.js';
 import { renderEmail } from './emails.js';
 
 const id = z.uuid();
@@ -42,7 +43,7 @@ const transitions: Record<Status, Status[]> = {
 const fail = (reply: FastifyReply, status: number, error: string) => reply.code(status).send({ error });
 
 type Mail = (to: string, subject: string, text: string, html?: string) => Promise<void>;
-export type AppOptions = { db: SeltivoDb; origin: string; secureCookies?: boolean; requireEmailVerification?: boolean; requireAdmin2FA?: boolean; sendMail?: Mail; teamEmail?: string; databaseBytes?: () => number; deleteCustomer?: (userId: string) => Promise<void>; logger?: boolean; router?: FastifyInstance };
+export type AppOptions = { dataLimits?: Partial<DataLimits>; db: SeltivoDb; origin: string; secureCookies?: boolean; requireEmailVerification?: boolean; requireAdmin2FA?: boolean; sendMail?: Mail; teamEmail?: string; databaseBytes?: () => number; deleteCustomer?: (userId: string) => Promise<void>; logger?: boolean; router?: FastifyInstance };
 const MAX_CONFIGURATIONS_PER_USER = 50;
 /** Автовідповідь у чаті, поки менеджер ще не відповів особисто. Мова = мова інтерфейсу клієнта. */
 const CHAT_AUTOREPLY = {
@@ -109,8 +110,20 @@ function configJson(value: unknown, templateId: string): string | null {
   return Buffer.byteLength(json) <= 8 * 1024 * 1024 ? json : null;
 }
 
-export function buildApp({ db, origin, secureCookies = false, requireEmailVerification = process.env.SELTIVO_REQUIRE_EMAIL_VERIFICATION === '1', requireAdmin2FA = process.env.SELTIVO_REQUIRE_ADMIN_2FA === '1', sendMail, teamEmail, databaseBytes, deleteCustomer, logger = process.env.NODE_ENV !== 'test', router }: AppOptions) {
+export function buildApp({ dataLimits, db, origin, secureCookies = false, requireEmailVerification = process.env.SELTIVO_REQUIRE_EMAIL_VERIFICATION === '1', requireAdmin2FA = process.env.SELTIVO_REQUIRE_ADMIN_2FA === '1', sendMail, teamEmail, databaseBytes, deleteCustomer, logger = process.env.NODE_ENV !== 'test', router }: AppOptions) {
   const app = router ?? Fastify({ logger, bodyLimit: 9 * 1024 * 1024, trustProxy: process.env.SELTIVO_TRUST_PROXY === '1' });
+  const limits = resolveDataLimits(dataLimits);
+  const storageAvailable = (reply: FastifyReply, additional: number, userId?: string): boolean => {
+    // Replacements that shrink data must remain available even above a ceiling.
+    if (additional <= 0) return true;
+    if (databaseBytes && databaseBytes() + additional >= limits.databaseBytes) {
+      fail(reply, 503, 'Сховище тимчасово заповнене. Спробуйте пізніше.'); return false;
+    }
+    if (userId && accountBytes(db, userId) + additional > limits.accountBytes) {
+      fail(reply, 422, 'Досягнуто ліміту даних акаунта. Видаліть зайві конфігурації або зверніться до підтримки.'); return false;
+    }
+    return true;
+  };
   const chatEvents = createChatEvents();
   const attempts = new Map<string, number[]>();
   const pruneAttempts = (current: number) => {
@@ -303,6 +316,7 @@ export function buildApp({ db, origin, secureCookies = false, requireEmailVerifi
     const timestamp = now();
     const hash = await hashPassword(body.password);
     const verifiedAt = requireEmailVerification ? null : timestamp;
+    if (!storageAvailable(reply, 2048)) return;
     try {
       db.prepare(`INSERT INTO users(id,email,password_hash,role,name,email_verified_at,created_at,updated_at) VALUES (?,?,?,'customer',?,?,?,?)`)
         .run(userId, normalized, hash, body.name, verifiedAt, timestamp, timestamp);
@@ -367,6 +381,11 @@ export function buildApp({ db, origin, secureCookies = false, requireEmailVerifi
     const body = parse(guestRequest, request.body, reply); if (!body) return;
     const trial = body.trial ? JSON.stringify(body.trial) : null;
     const features = JSON.stringify(body.features);
+    if (!db.prepare('SELECT id FROM guest_requests WHERE id=?').get(body.id)) {
+      const count = (db.prepare('SELECT COUNT(*) count FROM guest_requests').get() as { count: number }).count;
+      if (count >= limits.guestRequests) return fail(reply, 503, 'Приймання заявок тимчасово недоступне. Спробуйте пізніше.');
+      if (!storageAvailable(reply, Buffer.byteLength(JSON.stringify(body)))) return;
+    }
     const stored = db.prepare(`INSERT OR IGNORE INTO guest_requests
       (id,name,contact,features_json,budget,note,template_name,telegram_status,status,created_at,trial_json)
       VALUES (?,?,?,?,?,?,?,?,'new',?,?)`)
@@ -599,6 +618,7 @@ export function buildApp({ db, origin, secureCookies = false, requireEmailVerifi
     const activeCount = (db.prepare('SELECT COUNT(*) AS count FROM configurations WHERE owner_id=? AND deleted_at IS NULL').get(actor.id) as { count: number }).count;
     if (activeCount >= MAX_CONFIGURATIONS_PER_USER) return fail(reply, 422, 'Досягнуто ліміту збережених конфігурацій.');
     const json = configJson(body.data, body.templateId); if (!json) return fail(reply, 422, 'Конфігурація завелика або пошкоджена.');
+    if (!storageAvailable(reply, Buffer.byteLength(json), actor.id)) return;
     const configId = randomUUID(), timestamp = now();
     db.prepare('INSERT INTO configurations(id,owner_id,template_id,name,data_json,created_at,updated_at) VALUES (?,?,?,?,?,?,?)')
       .run(configId, actor.id, body.templateId, body.name, json, timestamp, timestamp);
@@ -617,9 +637,10 @@ export function buildApp({ db, origin, secureCookies = false, requireEmailVerifi
     const revision = Number(request.headers['if-match']);
     if (!Number.isInteger(revision) || revision < 1) return fail(reply, 400, 'Потрібна версія If-Match.');
     const configId = (request.params as { id: string }).id;
-    const existing = db.prepare('SELECT template_id FROM configurations WHERE id=? AND owner_id=? AND deleted_at IS NULL').get(configId, actor.id) as { template_id: string } | undefined;
+    const existing = db.prepare('SELECT template_id,length(CAST(data_json AS BLOB)) bytes FROM configurations WHERE id=? AND owner_id=? AND deleted_at IS NULL').get(configId, actor.id) as { template_id: string; bytes: number } | undefined;
     if (!existing) return fail(reply, 409, 'Конфігурацію змінено або не знайдено.');
     const json = configJson(body.data, existing.template_id); if (!json) return fail(reply, 422, 'Конфігурація завелика або пошкоджена.');
+    if (!storageAvailable(reply, Buffer.byteLength(json) - existing.bytes, actor.id)) return;
     const result = db.prepare('UPDATE configurations SET name=?,data_json=?,revision=revision+1,updated_at=? WHERE id=? AND owner_id=? AND revision=? AND deleted_at IS NULL')
       .run(body.name, json, now(), configId, actor.id, revision);
     if (!result.changes) return fail(reply, 409, 'Конфігурацію змінено або не знайдено.');
@@ -643,6 +664,8 @@ export function buildApp({ db, origin, secureCookies = false, requireEmailVerifi
       if (prior.template_id !== body.templateId || prior.template_name !== body.templateName || prior.configuration_id !== (body.configurationId ?? null) || prior.contact_json !== JSON.stringify(body.contact) || prior.note !== body.note || prior.features_json !== JSON.stringify(body.features)) return fail(reply, 409, 'Ключ повтору вже використано.');
       return reply.code(200).send(existing);
     }
+    const requestCount = (db.prepare('SELECT COUNT(*) count FROM requests WHERE customer_id=?').get(actor.id) as { count: number }).count;
+    if (requestCount >= limits.requestsPerAccount) return fail(reply, 422, 'Досягнуто ліміту заявок акаунта. Зверніться до підтримки.');
     let snapshot: string | null = null;
     if (body.configurationId) {
       const configuration = db.prepare('SELECT template_id,data_json,revision FROM configurations WHERE id=? AND owner_id=? AND deleted_at IS NULL')
@@ -653,6 +676,8 @@ export function buildApp({ db, origin, secureCookies = false, requireEmailVerifi
       }
       snapshot = configuration.data_json;
     }
+    const bytes = Buffer.byteLength((snapshot ?? '') + JSON.stringify(body.contact) + body.note + JSON.stringify(body.features));
+    if (!storageAvailable(reply, bytes, actor.id)) return;
     const requestId = randomUUID(), conversationId = randomUUID(), timestamp = now();
     // Мова клієнта = мова його інтерфейсу (cookie), інакше останнє збережене значення.
     // Зберігаємо її одразу, щоб вітальне повідомлення було тією ж мовою.
@@ -742,6 +767,11 @@ export function buildApp({ db, origin, secureCookies = false, requireEmailVerifi
       return reply.code(200).send(message);
     }
     if (row.status === 'completed' || row.status === 'cancelled') return fail(reply, 409, 'Діалог завершено.');
+    if (actor.role === 'customer') {
+      const count = (db.prepare('SELECT COUNT(*) count FROM messages WHERE conversation_id=?').get(row.conversation_id) as { count: number }).count;
+      if (count >= limits.messagesPerConversation) return fail(reply, 422, 'Досягнуто ліміту повідомлень діалогу. Зверніться до підтримки.');
+    }
+    if (!storageAvailable(reply, Buffer.byteLength(body.body), actor.role === 'customer' ? actor.id : undefined)) return;
     const timestamp = now();
     // Мова клієнта = мова його інтерфейсу (cookie). Якщо cookie ще немає —
     // беремо останнє збережене значення, щоб відповідь не міняла мову випадково.
