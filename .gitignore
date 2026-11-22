@@ -8,3 +8,5 @@ data/
 .wrangler/
 .codex-worker-smoke/
 .seltivo-admin-initial-password
+
+.tmp-build/

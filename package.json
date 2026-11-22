@@ -16,7 +16,9 @@
     "typecheck": "tsc --noEmit",
     "test": "node --import tsx --test tests/*.test.ts",
     "dev:cloudflare": "wrangler dev",
-    "deploy:cloudflare": "wrangler deploy"
+    "deploy:cloudflare": "wrangler deploy",
+    "cf:typegen": "wrangler types cloudflare-env.d.ts --env-interface WorkerEnv --include-runtime false --strict-vars false",
+    "cf:types:check": "wrangler types cloudflare-env.d.ts --env-interface WorkerEnv --include-runtime false --strict-vars false --check"
   },
   "dependencies": {
     "better-sqlite3": "^12.4.1",

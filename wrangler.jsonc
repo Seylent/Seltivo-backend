@@ -19,7 +19,10 @@
       { "name": "SELTIVO_DELETIONS", "class_name": "DeletionLedger" }
     ]
   },
-  "r2_buckets": [{ "binding": "SELTIVO_BACKUP_BUCKET", "bucket_name": "seltivo-backups" }],
+  "r2_buckets": [
+    { "binding": "SELTIVO_BACKUP_BUCKET", "bucket_name": "seltivo-backups" },
+    { "binding": "SELTIVO_SITE_DATA", "bucket_name": "seltivo-data" }
+  ],
   "triggers": { "crons": ["0 2 * * *", "10 * * * *"] },
   "migrations": [
     { "tag": "v1", "new_sqlite_classes": ["SeltivoData"] },
@@ -41,7 +44,10 @@
           { "name": "SELTIVO_DELETIONS", "class_name": "DeletionLedger" }
         ]
       },
-      "r2_buckets": [{ "binding": "SELTIVO_BACKUP_BUCKET", "bucket_name": "seltivo-staging-backups" }],
+      "r2_buckets": [
+        { "binding": "SELTIVO_BACKUP_BUCKET", "bucket_name": "seltivo-staging-backups" },
+        { "binding": "SELTIVO_SITE_DATA", "bucket_name": "seltivo-staging-data" }
+      ],
       "migrations": [
         { "tag": "v1", "new_sqlite_classes": ["SeltivoData"] },
         { "tag": "v2", "new_sqlite_classes": ["DeletionLedger"] }
