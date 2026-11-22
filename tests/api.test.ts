@@ -367,7 +367,7 @@ test('login sends a code to an existing customer who needs to verify', async () 
 test('password policy accepts six characters and rejects five', async () => {
   const db = openDatabase(':memory:');
   const app = buildApp({ db, origin, logger: false });
-  const call = (url: string, payload: unknown, cookie?: string) => app.inject({ method: 'POST', url, headers: { origin, ...(cookie ? { cookie } : {}) }, payload });
+  const call = (url: string, payload: Record<string, unknown>, cookie?: string) => app.inject({ method: 'POST', url, headers: { origin, ...(cookie ? { cookie } : {}) }, payload });
   try {
     assert.equal((await call('/api/v1/auth/register', { email: 'six@example.test', password: '123456', name: 'Six' })).statusCode, 201);
     assert.equal((await call('/api/v1/auth/register', { email: 'five@example.test', password: '12345', name: 'Five' })).statusCode, 422);
