@@ -132,6 +132,88 @@ test('registration, ownership, idempotent requests, chat and admin status', asyn
   }
 });
 
+test('a customer gets exactly one auto-reply in chat, without emails or notification spam', async () => {
+  const db = openDatabase(':memory:');
+  const sent: string[] = [];
+  const app = buildApp({ db, origin, logger: false, teamEmail: 'team@example.test',
+    sendMail: async (to) => { sent.push(to); } });
+  const call = async (method: string, url: string, payload?: unknown, cookie?: string) => {
+    const response: any = await app.inject({ method, url, headers: { origin, ...(cookie ? { cookie } : {}) }, payload } as any);
+    return { status: response.statusCode, body: response.body ? JSON.parse(response.body) : null, cookie: response.headers['set-cookie'] as string | undefined };
+  };
+  const autoReply = 'Привіт, менеджер скоро відповість вам';
+  try {
+    // У продакшені адмін існує ще до першого листа — автовідповідь пишемо від нього.
+    const adminId = randomUUID(), timestamp = now();
+    db.prepare("INSERT INTO users(id,email,password_hash,role,name,email_verified_at,created_at,updated_at) VALUES (?,?,?,'admin','Admin',?,?,?)")
+      .run(adminId, 'admin@example.test', await hashPassword('VeryStrongPass123!'), timestamp, timestamp, timestamp);
+    const admin = (await call('POST', '/api/v1/auth/login', { email: 'admin@example.test', password: 'VeryStrongPass123!' })).cookie!.split(';')[0];
+
+    await call('POST', '/api/v1/auth/register', { email: 'customer@example.test', password: 'VeryStrongPass123!', name: 'Customer' });
+    const customer = (await call('POST', '/api/v1/auth/login', { email: 'customer@example.test', password: 'VeryStrongPass123!' })).cookie!.split(';')[0];
+    const config = await call('POST', '/api/v1/configurations', { templateId: 'fashion-01', name: 'Мій сайт', data: { id: 'brand', name: 'Brand', colors: {}, hero: {}, home: {}, products: [] } }, customer);
+    const request = await call('POST', '/api/v1/requests', { templateId: 'fashion-01', templateName: 'Fashion 01', configurationId: config.body.id, contact: { name: 'Customer' }, note: '', features: [], clientSubmissionId: randomUUID() }, customer);
+    const url = `/api/v1/requests/${request.body.id}/messages`;
+    const key = randomUUID();
+    const first = await call('POST', url, { body: 'Перше питання', clientMessageId: key }, customer);
+    assert.equal(first.status, 201);
+    let items = (await call('GET', url, undefined, customer)).body.items;
+    assert.equal(items.length, 2);
+    assert.equal(items[1].body, autoReply);
+    assert.equal(items[1].senderId, adminId);
+    assert.equal(sent.length, 1); // автовідповідь листа не надсилає
+
+    assert.equal((await call('POST', url, { body: 'Перше питання', clientMessageId: key }, customer)).status, 200);
+    assert.equal((await call('POST', url, { body: 'Друге питання', clientMessageId: randomUUID() }, customer)).status, 201);
+    items = (await call('GET', url, undefined, customer)).body.items;
+    assert.equal(items.length, 3);
+    assert.equal(items.filter((message: { body: string }) => message.body === autoReply).length, 1);
+
+    assert.equal((await call('POST', url, { body: 'Відповідаю особисто', clientMessageId: randomUUID() }, admin)).status, 201);
+    items = (await call('GET', url, undefined, customer)).body.items;
+    assert.equal(items.length, 4);
+    assert.equal(items.filter((message: { body: string }) => message.body === autoReply).length, 1);
+  } finally { await app.close(); db.close(); }
+});
+
+test('auto-reply uses the chat language and managers can see the customer language', async () => {
+  const db = openDatabase(':memory:');
+  const app = buildApp({ db, origin, logger: false });
+  const call = async (method: string, url: string, payload?: unknown, cookie?: string, extraHeaders: Record<string, string> = {}) => {
+    const response: any = await app.inject({ method, url, headers: { origin, ...(cookie ? { cookie } : {}), ...extraHeaders }, payload } as any);
+    return { status: response.statusCode, body: response.body ? JSON.parse(response.body) : null, cookie: response.headers['set-cookie'] as string | undefined };
+  };
+  try {
+    const adminId = randomUUID(), timestamp = now();
+    db.prepare("INSERT INTO users(id,email,password_hash,role,name,email_verified_at,created_at,updated_at) VALUES (?,?,?,'admin','Admin',?,?,?)")
+      .run(adminId, 'admin@example.test', await hashPassword('VeryStrongPass123!'), timestamp, timestamp, timestamp);
+    const admin = (await call('POST', '/api/v1/auth/login', { email: 'admin@example.test', password: 'VeryStrongPass123!' })).cookie!.split(';')[0];
+
+    await call('POST', '/api/v1/auth/register', { email: 'english@example.test', password: 'VeryStrongPass123!', name: 'English Customer' });
+    const login = await call('POST', '/api/v1/auth/login', { email: 'english@example.test', password: 'VeryStrongPass123!' });
+    const customer = login.cookie!.split(';')[0];
+    const englishCookie = `${customer}; seltivo-locale=en`;
+    assert.equal((await call('GET', '/api/v1/me', undefined, englishCookie)).body.locale, null);
+
+    const config = await call('POST', '/api/v1/configurations', { templateId: 'fashion-01', name: 'My site', data: { id: 'brand', name: 'Brand', colors: {}, hero: {}, home: {}, products: [] } }, englishCookie);
+    const request = await call('POST', '/api/v1/requests', { templateId: 'fashion-01', templateName: 'Fashion 01', configurationId: config.body.id, contact: { name: 'English Customer' }, note: '', features: [], clientSubmissionId: randomUUID() }, englishCookie);
+    const url = `/api/v1/requests/${request.body.id}/messages`;
+    assert.equal((await call('POST', url, { body: 'Hello', clientMessageId: randomUUID() }, englishCookie)).status, 201);
+
+    const items = (await call('GET', url, undefined, englishCookie)).body.items;
+    assert.equal(items[1].body, 'Hi! A manager will get back to you shortly');
+    assert.equal((await call('GET', '/api/v1/me', undefined, englishCookie)).body.locale, 'en');
+
+    // Менеджер бачить мову клієнта в заявці, списку заявок і картці клієнта.
+    assert.equal((await call('GET', `/api/v1/requests/${request.body.id}`, undefined, admin)).body.customerLocale, 'en');
+    assert.equal((await call('GET', '/api/v1/admin/requests', undefined, admin)).body.items[0].customerLocale, 'en');
+    assert.equal((await call('GET', '/api/v1/admin/customers', undefined, admin)).body.items[0].locale, 'en');
+    const customerId = (await call('GET', '/api/v1/me', undefined, englishCookie)).body.id;
+    assert.equal((await call('GET', `/api/v1/admin/customers/${customerId}`, undefined, admin)).body.locale, 'en');
+    assert.equal((await call('GET', '/api/v1/admin/overview', undefined, admin)).body.waitingReplies[0].customerLocale, 'en');
+  } finally { await app.close(); db.close(); }
+});
+
 test('failed chat email is visible to admins and retry does not create another message', async () => {
   const db = openDatabase(':memory:');
   let sends = 0;
@@ -166,7 +248,8 @@ test('failed chat email is visible to admins and retry does not create another m
     assert.equal((await call('POST', retryUrl, {}, admin)).status, 409);
     assert.equal(sends, 2);
     assert.equal((await call('GET', '/api/v1/admin/email-notifications', undefined, admin)).body.items.length, 0);
-    assert.equal((await call('GET', url, undefined, customer)).body.items.length, 1);
+    // Клієнтське повідомлення + автовідповідь «менеджер скоро відповість».
+    assert.equal((await call('GET', url, undefined, customer)).body.items.length, 2);
   } finally { await app.close(); db.close(); }
 });
 

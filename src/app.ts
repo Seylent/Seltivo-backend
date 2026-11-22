@@ -42,6 +42,23 @@ const fail = (reply: FastifyReply, status: number, error: string) => reply.code(
 type Mail = (to: string, subject: string, text: string) => Promise<void>;
 export type AppOptions = { db: SeltivoDb; origin: string; secureCookies?: boolean; requireEmailVerification?: boolean; requireAdmin2FA?: boolean; sendMail?: Mail; teamEmail?: string; databaseBytes?: () => number; deleteCustomer?: (userId: string) => Promise<void>; logger?: boolean; router?: FastifyInstance };
 const MAX_CONFIGURATIONS_PER_USER = 50;
+/** Автовідповідь у чаті, поки менеджер ще не відповів особисто. Мова = мова інтерфейсу клієнта. */
+const CHAT_AUTOREPLY = {
+  uk: 'Привіт, менеджер скоро відповість вам',
+  en: 'Hi! A manager will get back to you shortly',
+} as const;
+/** За цим префіксом автовідповідь відрізняють від живої відповіді менеджера в звітах. */
+const AUTOREPLY_KEY_PREFIX = 'autoreply:';
+/** LocaleProvider Next-застосунку зберігає вибрану мову саме в цій cookie. */
+const LOCALE_COOKIE = 'seltivo-locale';
+const locales = ['uk', 'en'] as const;
+type Locale = typeof locales[number];
+const isLocale = (value: unknown): value is Locale => typeof value === 'string' && (locales as readonly string[]).includes(value);
+function localeFromRequest(request: FastifyRequest): Locale | null {
+  const raw = request.headers.cookie?.split(';').map((part) => part.trim()).find((part) => part.startsWith(`${LOCALE_COOKIE}=`));
+  const value = raw?.slice(LOCALE_COOKIE.length + 1);
+  return isLocale(value) ? value : null;
+}
 const RETENTION_MS = 30 * 24 * 60 * 60 * 1000;
 const PNG_SIGNATURE = Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]);
 const JPEG_SIGNATURE = Buffer.from([255, 216, 255]);
@@ -503,8 +520,8 @@ export function buildApp({ db, origin, secureCookies = false, requireEmailVerifi
   });
   app.get('/api/v1/me', async (request, reply) => {
     const actor = auth(request, reply); if (!actor) return;
-    const row = db.prepare('SELECT id,email,role,name,phone,telegram,email_verified_at FROM users WHERE id=?').get(actor.id) as any;
-    return { id: row.id, email: row.email, role: row.role, name: row.name, phone: row.phone, telegram: row.telegram,
+    const row = db.prepare('SELECT id,email,role,name,phone,telegram,locale,email_verified_at FROM users WHERE id=?').get(actor.id) as any;
+    return { id: row.id, email: row.email, role: row.role, name: row.name, phone: row.phone, telegram: row.telegram, locale: row.locale,
       emailVerified: Boolean(row.email_verified_at), accountDeletionAvailable: actor.role === 'customer' && Boolean(deleteCustomer) };
   });
   app.patch('/api/v1/me', async (request, reply) => {
@@ -624,10 +641,10 @@ export function buildApp({ db, origin, secureCookies = false, requireEmailVerifi
   app.get('/api/v1/requests', async (request, reply) => {
     const actor = auth(request, reply, 'customer'); if (!actor) return;
     const query = parse(page, request.query, reply); if (!query) return;
-    const items = db.prepare(`SELECT r.id,r.template_id templateId,r.template_name templateName,r.status,r.created_at createdAt,r.updated_at updatedAt,
+    const items = db.prepare(`SELECT r.id,r.template_id templateId,r.template_name templateName,r.status,r.created_at createdAt,r.updated_at updatedAt,u.locale customerLocale,
       (SELECT m.body FROM messages m WHERE m.conversation_id=c.id ORDER BY m.id DESC LIMIT 1) lastMessage,
       (SELECT m.created_at FROM messages m WHERE m.conversation_id=c.id ORDER BY m.id DESC LIMIT 1) lastMessageAt
-      FROM requests r JOIN conversations c ON c.request_id=r.id
+      FROM requests r JOIN conversations c ON c.request_id=r.id JOIN users u ON u.id=r.customer_id
       WHERE r.customer_id=? ORDER BY r.created_at DESC,r.id DESC LIMIT ? OFFSET ?`).all(actor.id, query.limit, query.offset);
     return { items, nextOffset: (items as unknown[]).length === query.limit ? query.offset + query.limit : null };
   });
@@ -635,7 +652,8 @@ export function buildApp({ db, origin, secureCookies = false, requireEmailVerifi
     const actor = auth(request, reply); if (!actor) return;
     const row = requestRow((request.params as any).id, actor); if (!row) return fail(reply, 404, 'Не знайдено.');
     const events = db.prepare('SELECT old_status oldStatus,new_status newStatus,reason,created_at createdAt FROM request_events WHERE request_id=? ORDER BY created_at,rowid').all(row.id);
-    return { id: row.id, customerId: row.customer_id, templateId: row.template_id, templateName: row.template_name, status: row.status, statusVersion: row.status_version, configuration: row.config_snapshot_json ? JSON.parse(row.config_snapshot_json) : null, contact: JSON.parse(row.contact_json), note: row.note, features: JSON.parse(row.features_json), conversationId: row.conversation_id, events, createdAt: row.created_at };
+    const customer = db.prepare('SELECT locale FROM users WHERE id=?').get(row.customer_id) as { locale: string | null } | undefined;
+    return { id: row.id, customerId: row.customer_id, customerLocale: customer?.locale ?? null, templateId: row.template_id, templateName: row.template_name, status: row.status, statusVersion: row.status_version, configuration: row.config_snapshot_json ? JSON.parse(row.config_snapshot_json) : null, contact: JSON.parse(row.contact_json), note: row.note, features: JSON.parse(row.features_json), conversationId: row.conversation_id, events, createdAt: row.created_at };
   });
   app.delete('/api/v1/requests/:id', async (request, reply) => {
     const actor = auth(request, reply, 'customer'); if (!actor || !verified(actor, reply)) return;
@@ -687,12 +705,29 @@ export function buildApp({ db, origin, secureCookies = false, requireEmailVerifi
     }
     if (row.status === 'completed' || row.status === 'cancelled') return fail(reply, 409, 'Діалог завершено.');
     const timestamp = now();
+    // Мова клієнта = мова його інтерфейсу (cookie). Якщо cookie ще немає —
+    // беремо останнє збережене значення, щоб відповідь не міняла мову випадково.
+    let locale: Locale | null = null;
+    if (actor.role === 'customer') {
+      const cookieLocale = localeFromRequest(request);
+      const saved = (db.prepare('SELECT locale FROM users WHERE id=?').get(actor.id) as { locale: string | null } | undefined)?.locale;
+      locale = cookieLocale ?? (isLocale(saved) ? saved : null);
+      if (cookieLocale) db.prepare('UPDATE users SET locale=? WHERE id=?').run(cookieLocale, actor.id);
+    }
+    // Пишемо автовідповідь від імені менеджера — так це звичайне повідомлення в
+    // діалозі, яке бачать обидва, і одразу йде клієнту через SSE. Фіксований ключ
+    // на заявку дає рівно одну автовідповідь, повтори надсилання її не дублюють.
+    const autoReplySender = actor.role === 'customer'
+      ? (db.prepare("SELECT id FROM users WHERE role='admin' AND disabled_at IS NULL ORDER BY created_at ASC LIMIT 1").get() as { id: string } | undefined)
+      : undefined;
     const recipient = actor.role === 'admin'
       ? (db.prepare('SELECT email FROM users WHERE id=?').get(row.customer_id) as { email: string }).email
       : teamEmail;
     const notificationId = recipient ? randomUUID() : null;
     const messageId = db.transaction(() => {
       const result = db.prepare('INSERT INTO messages(conversation_id,sender_id,client_message_id,body,created_at) VALUES (?,?,?,?,?)').run(row.conversation_id, actor.id, body.clientMessageId, body.body, timestamp);
+      if (autoReplySender) db.prepare('INSERT OR IGNORE INTO messages(conversation_id,sender_id,client_message_id,body,created_at) VALUES (?,?,?,?,?)')
+        .run(row.conversation_id, autoReplySender.id, `${AUTOREPLY_KEY_PREFIX}${row.id}`, CHAT_AUTOREPLY[locale ?? 'uk'], timestamp);
       if (recipient && notificationId) db.prepare(`INSERT INTO email_notifications(id,message_id,recipient,status,created_at)
         VALUES (?,?,?,'pending',?)`).run(notificationId, Number(result.lastInsertRowid), recipient, timestamp);
       if (actor.role === 'admin') db.prepare('INSERT INTO notifications(id,recipient_id,request_id,kind,status,created_at) VALUES (?,?,?,\'message\',NULL,?)')
@@ -774,14 +809,14 @@ export function buildApp({ db, origin, secureCookies = false, requireEmailVerifi
   app.get('/api/v1/admin/customers', async (request, reply) => {
     if (!auth(request, reply, 'admin')) return;
     const query = parse(page, request.query, reply); if (!query) return;
-    const items = db.prepare("SELECT id,email,name,phone,telegram,created_at createdAt FROM users WHERE role='customer' ORDER BY created_at DESC,id DESC LIMIT ? OFFSET ?").all(query.limit, query.offset);
+    const items = db.prepare("SELECT id,email,name,phone,telegram,locale,created_at createdAt FROM users WHERE role='customer' ORDER BY created_at DESC,id DESC LIMIT ? OFFSET ?").all(query.limit, query.offset);
     return { items, nextOffset: (items as unknown[]).length === query.limit ? query.offset + query.limit : null };
   });
   app.get('/api/v1/admin/customers/:id', async (request, reply) => {
     if (!auth(request, reply, 'admin')) return;
     const customerId = (request.params as { id: string }).id;
-    type CustomerRow = { id: string; email: string; name: string; phone: string | null; telegram: string | null; createdAt: string; emailVerifiedAt: string | null };
-    const row = db.prepare("SELECT id,email,name,phone,telegram,created_at createdAt,email_verified_at emailVerifiedAt FROM users WHERE id=? AND role='customer'").get(customerId) as CustomerRow | undefined;
+    type CustomerRow = { id: string; email: string; name: string; phone: string | null; telegram: string | null; locale: string | null; createdAt: string; emailVerifiedAt: string | null };
+    const row = db.prepare("SELECT id,email,name,phone,telegram,locale,created_at createdAt,email_verified_at emailVerifiedAt FROM users WHERE id=? AND role='customer'").get(customerId) as CustomerRow | undefined;
     if (!row) return fail(reply, 404, 'Не знайдено.');
     const requests = db.prepare(`SELECT id,template_name templateName,status,created_at createdAt,updated_at updatedAt
       FROM requests WHERE customer_id=? ORDER BY created_at DESC,id DESC LIMIT 30`).all(customerId);
@@ -798,7 +833,7 @@ export function buildApp({ db, origin, secureCookies = false, requireEmailVerifi
   app.get('/api/v1/admin/requests', async (request, reply) => {
     if (!auth(request, reply, 'admin')) return;
     const query = parse(page.extend({ status: z.enum(statuses).optional() }), request.query, reply); if (!query) return;
-    const sql = `SELECT r.id,r.customer_id customerId,u.name customerName,r.template_id templateId,r.template_name templateName,r.status,r.status_version statusVersion,r.created_at createdAt,r.updated_at updatedAt,(SELECT m.body FROM messages m WHERE m.conversation_id=c.id ORDER BY m.id DESC LIMIT 1) lastMessage,(SELECT m.created_at FROM messages m WHERE m.conversation_id=c.id ORDER BY m.id DESC LIMIT 1) lastMessageAt FROM requests r JOIN users u ON u.id=r.customer_id JOIN conversations c ON c.request_id=r.id`;
+    const sql = `SELECT r.id,r.customer_id customerId,u.name customerName,u.locale customerLocale,r.template_id templateId,r.template_name templateName,r.status,r.status_version statusVersion,r.created_at createdAt,r.updated_at updatedAt,(SELECT m.body FROM messages m WHERE m.conversation_id=c.id ORDER BY m.id DESC LIMIT 1) lastMessage,(SELECT m.created_at FROM messages m WHERE m.conversation_id=c.id ORDER BY m.id DESC LIMIT 1) lastMessageAt FROM requests r JOIN users u ON u.id=r.customer_id JOIN conversations c ON c.request_id=r.id`;
     const items = query.status ? db.prepare(`${sql} WHERE r.status=? ORDER BY r.updated_at DESC,r.id DESC LIMIT ? OFFSET ?`).all(query.status, query.limit, query.offset) : db.prepare(`${sql} ORDER BY r.updated_at DESC,r.id DESC LIMIT ? OFFSET ?`).all(query.limit, query.offset);
     return { items, nextOffset: (items as unknown[]).length === query.limit ? query.offset + query.limit : null };
   });
@@ -903,13 +938,15 @@ export function buildApp({ db, origin, secureCookies = false, requireEmailVerifi
       JOIN messages m ON m.conversation_id=c.id AND m.sender_id<>?
       LEFT JOIN conversation_reads cr ON cr.conversation_id=c.id AND cr.user_id=?
       WHERE m.id>COALESCE(cr.last_read_message_id,0)`).get(actor.id, actor.id) as { total: number | null };
-    const waitingAccount = db.prepare(`SELECT r.id,r.template_name templateName,u.name customerName,COUNT(*) OVER () total,
+    // Автовідповідь не закриває чергу «очікують відповіді» — там має бути жива відповідь менеджера.
+    const notAutoreply = `m.client_message_id NOT LIKE '${AUTOREPLY_KEY_PREFIX}%'`;
+    const waitingAccount = db.prepare(`SELECT r.id,r.template_name templateName,u.name customerName,u.locale customerLocale,COUNT(*) OVER () total,
       COALESCE((SELECT m.created_at FROM messages m JOIN users sender ON sender.id=m.sender_id
-        WHERE m.conversation_id=c.id AND sender.role='customer' ORDER BY m.id DESC LIMIT 1),r.created_at) waitingSince
+        WHERE m.conversation_id=c.id AND ${notAutoreply} AND sender.role='customer' ORDER BY m.id DESC LIMIT 1),r.created_at) waitingSince
       FROM requests r JOIN users u ON u.id=r.customer_id JOIN conversations c ON c.request_id=r.id
       WHERE r.status NOT IN ('completed','cancelled')
         AND COALESCE((SELECT sender.role FROM messages m JOIN users sender ON sender.id=m.sender_id
-          WHERE m.conversation_id=c.id ORDER BY m.id DESC LIMIT 1),'customer')='customer'
+          WHERE m.conversation_id=c.id AND ${notAutoreply} ORDER BY m.id DESC LIMIT 1),'customer')='customer'
       ORDER BY waitingSince ASC,r.id ASC LIMIT 5`).all() as Array<{ id: string; templateName: string; customerName: string; waitingSince: string; total: number }>;
     const waitingGuest = db.prepare(`SELECT id,name customerName,template_name templateName,created_at waitingSince,COUNT(*) OVER () total
       FROM guest_requests WHERE status='new' ORDER BY created_at ASC,id ASC LIMIT 5`).all() as Array<{ id: string; templateName: string | null; customerName: string; waitingSince: string; total: number }>;

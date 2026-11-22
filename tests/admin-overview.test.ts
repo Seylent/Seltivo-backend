@@ -70,7 +70,8 @@ test('admin overview and customer details aggregate real data and stay admin-onl
     assert.equal(detail.body.name, 'Customer');
     assert.equal(detail.body.stats.requestsCount, 1);
     assert.equal(detail.body.stats.configurationsCount, 1);
-    assert.equal(detail.body.stats.messagesCount, 3);
+    // 3 живі повідомлення + одна автовідповідь на перше звернення клієнта.
+    assert.equal(detail.body.stats.messagesCount, 4);
     assert.equal(detail.body.requests.length, 1);
     assert.equal(detail.body.configurations.length, 1);
 

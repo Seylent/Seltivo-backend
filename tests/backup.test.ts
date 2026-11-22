@@ -86,7 +86,7 @@ test('a restored backup supports login, requests and chat in an isolated staging
       const reply = await stagingApp.inject({ method: 'POST', url: `/api/v1/requests/${requestId}/messages`, headers: { origin, cookie: adminCookie }, payload: { body: 'After restore', clientMessageId: randomUUID() } });
       assert.equal(reply.statusCode, 201);
       const conversation = await stagingApp.inject({ method: 'GET', url: `/api/v1/requests/${requestId}/messages`, headers: { cookie: restoredCookie } });
-      assert.deepEqual(conversation.json().items.map((message: { body: string }) => message.body), ['Before backup', 'After restore']);
+      assert.deepEqual(conversation.json().items.map((message: { body: string }) => message.body), ['Before backup', 'Привіт, менеджер скоро відповість вам', 'After restore']);
     } finally { await stagingApp.close(); staging.close(); }
   } finally {
     if (source.open) { await app.close(); source.close(); }

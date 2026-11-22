@@ -141,4 +141,7 @@ export const MIGRATIONS = [
     UPDATE users SET email_verified_at=NULL WHERE role='customer';
     DELETE FROM sessions WHERE user_id IN (SELECT id FROM users WHERE role='customer');
   ` },
+  { version: 10, sql: `
+    ALTER TABLE users ADD COLUMN locale TEXT CHECK(locale IS NULL OR locale IN ('uk','en'));
+  ` },
 ] as const;

@@ -107,8 +107,14 @@ test('existing customers must verify again while admin access remains intact', (
   const directory = mkdtempSync(join(tmpdir(), 'seltivo-migration-'));
   const filename = join(directory, 'reverify.db');
   try {
-    openDatabase(filename).close();
+    // Справжня схема v8, а не повністю мігрована БД з підміненим user_version:
+    // інакше v10 спробує додати вже наявну колонку locale.
     const old = new Database(filename);
+    old.exec(SCHEMA_SQL);
+    for (const migration of MIGRATIONS) {
+      if (migration.version > 8) break;
+      if (migration.version > 1) old.exec(migration.sql);
+    }
     old.pragma('user_version = 8');
     for (const [id, role] of [['customer-1', 'customer'], ['admin-1', 'admin']]) {
       old.prepare('INSERT INTO users(id,email,password_hash,role,name,email_verified_at,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?)')
