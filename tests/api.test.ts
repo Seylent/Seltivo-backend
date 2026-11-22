@@ -380,3 +380,72 @@ test('password policy accepts six characters and rejects five', async () => {
     assert.equal((await call('/api/v1/auth/change-password', { currentPassword: '654321', newPassword: '12345' }, nextLogin.headers['set-cookie'] as string | undefined)).statusCode, 422);
   } finally { db.close(); }
 });
+
+test('unread count is fresh right after a new request (cache invalidated)', async () => {
+  const db = openDatabase(':memory:');
+  const app = buildApp({ db, origin, logger: false });
+  const call = async (method: string, url: string, payload?: unknown, cookie?: string) => {
+    const response: any = await app.inject({ method, url, headers: { origin, ...(cookie ? { cookie } : {}) }, payload } as any);
+    return { status: response.statusCode, body: response.body ? JSON.parse(response.body) : null, cookie: response.headers['set-cookie'] as string | undefined };
+  };
+  try {
+    const timestamp = now();
+    db.prepare("INSERT INTO users(id,email,password_hash,role,name,email_verified_at,created_at,updated_at) VALUES (?,?,?,'admin','Admin',?,?,?)")
+      .run(randomUUID(), 'admin@cache.test', await hashPassword('VeryStrongPass123!'), timestamp, timestamp, timestamp);
+    assert.equal((await call('POST', '/api/v1/auth/register', { email: 'cache@example.test', password: 'VeryStrongPass123!', name: 'Cache' })).status, 201);
+    const login = await call('POST', '/api/v1/auth/login', { email: 'cache@example.test', password: 'VeryStrongPass123!' });
+    const cookie = login.cookie!.split(';')[0];
+
+    // Перший запит заповнює 10-секундний кеш лічильника.
+    assert.equal((await call('GET', '/api/v1/notifications/unread-count', undefined, cookie)).body.total, 0);
+
+    const created = await call('POST', '/api/v1/requests', {
+      templateId: 'fashion-01', templateName: 'Fashion 01',
+      contact: { name: 'Cache', email: 'cache@example.test' }, note: '', features: [],
+      clientSubmissionId: randomUUID(),
+    }, cookie);
+    assert.equal(created.status, 201);
+
+    // Нова заявка створює непрочитане повідомлення-автовідповідь — лічильник
+    // має оновитися одразу, без очікування закінчення TTL кешу.
+    const after = await call('GET', '/api/v1/notifications/unread-count', undefined, cookie);
+    assert.equal(after.body.total, 1);
+  } finally {
+    await app.close(); db.close();
+  }
+});
+
+test('new request auto-reply shows up in the customer notification bell', async () => {
+  const db = openDatabase(':memory:');
+  const app = buildApp({ db, origin, logger: false, teamEmail: 'team@example.test' });
+  const call = async (method: string, url: string, payload?: unknown, cookie?: string) => {
+    const response: any = await app.inject({ method, url, headers: { origin, ...(cookie ? { cookie } : {}) }, payload } as any);
+    return { status: response.statusCode, body: response.body ? JSON.parse(response.body) : null, cookie: response.headers['set-cookie'] as string | undefined };
+  };
+  try {
+    const timestamp = now();
+    db.prepare("INSERT INTO users(id,email,password_hash,role,name,email_verified_at,created_at,updated_at) VALUES (?,?,?,'admin','Admin',?,?,?)")
+      .run(randomUUID(), 'admin@bell.test', await hashPassword('VeryStrongPass123!'), timestamp, timestamp, timestamp);
+    assert.equal((await call('POST', '/api/v1/auth/register', { email: 'bell@example.test', password: 'VeryStrongPass123!', name: 'Bell' })).status, 201);
+    const cookie = (await call('POST', '/api/v1/auth/login', { email: 'bell@example.test', password: 'VeryStrongPass123!' })).cookie!.split(';')[0];
+
+    const created = await call('POST', '/api/v1/requests', {
+      templateId: 'fashion-01', templateName: 'Fashion 01',
+      contact: { name: 'Bell', email: 'bell@example.test' }, note: '', features: [],
+      clientSubmissionId: randomUUID(),
+    }, cookie);
+    assert.equal(created.status, 201);
+
+    const notifications = await call('GET', '/api/v1/notifications', undefined, cookie);
+    assert.equal(notifications.body.unread, 1);
+    assert.equal(notifications.body.items.length, 1);
+    assert.equal(notifications.body.items[0].kind, 'message');
+    assert.equal(notifications.body.items[0].requestId, created.body.id);
+
+    // Прочитання чату знімає і дзвіночок, і непрочитане повідомлення.
+    assert.equal((await call('PATCH', `/api/v1/notifications/requests/${created.body.id}/read`, {}, cookie)).status, 204);
+    assert.equal((await call('GET', '/api/v1/notifications', undefined, cookie)).body.unread, 0);
+  } finally {
+    await app.close(); db.close();
+  }
+});

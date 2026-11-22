@@ -41,7 +41,7 @@ const transitions: Record<Status, Status[]> = {
 const fail = (reply: FastifyReply, status: number, error: string) => reply.code(status).send({ error });
 
 type Mail = (to: string, subject: string, text: string, html?: string) => Promise<void>;
-export type AppOptions = { db: SeltivoDb; origin: string; secureCookies?: boolean; requireEmailVerification?: boolean; requireAdmin2FA?: boolean; sendMail?: Mail; teamEmail?: string; databaseBytes?: () => number; deleteCustomer?: (userId: string) => Promise<void>; logger?: boolean; router?: FastifyInstance };
+export type AppOptions = { db: SeltivoDb; origin: string; secureCookies?: boolean; requireEmailVerification?: boolean; requireAdmin2FA?: boolean; sendMail?: Mail; teamEmail?: string; databaseBytes?: () => number; deleteCustomer?: (userId: string) => Promise<void>; selfServiceDeletionEnabled?: boolean; logger?: boolean; router?: FastifyInstance };
 const MAX_CONFIGURATIONS_PER_USER = 50;
 /** Автовідповідь у чаті, поки менеджер ще не відповів особисто. Мова = мова інтерфейсу клієнта. */
 const CHAT_AUTOREPLY = {
@@ -108,7 +108,7 @@ function configJson(value: unknown, templateId: string): string | null {
   return Buffer.byteLength(json) <= 8 * 1024 * 1024 ? json : null;
 }
 
-export function buildApp({ db, origin, secureCookies = false, requireEmailVerification = process.env.SELTIVO_REQUIRE_EMAIL_VERIFICATION === '1', requireAdmin2FA = process.env.SELTIVO_REQUIRE_ADMIN_2FA === '1', sendMail, teamEmail, databaseBytes, deleteCustomer, logger = process.env.NODE_ENV !== 'test', router }: AppOptions) {
+export function buildApp({ db, origin, secureCookies = false, requireEmailVerification = process.env.SELTIVO_REQUIRE_EMAIL_VERIFICATION === '1', requireAdmin2FA = process.env.SELTIVO_REQUIRE_ADMIN_2FA === '1', sendMail, teamEmail, databaseBytes, deleteCustomer, selfServiceDeletionEnabled = true, logger = process.env.NODE_ENV !== 'test', router }: AppOptions) {
   const app = router ?? Fastify({ logger, bodyLimit: 9 * 1024 * 1024, trustProxy: process.env.SELTIVO_TRUST_PROXY === '1' });
   const chatEvents = createChatEvents();
   const attempts = new Map<string, number[]>();
@@ -539,7 +539,7 @@ export function buildApp({ db, origin, secureCookies = false, requireEmailVerifi
     const actor = auth(request, reply); if (!actor) return;
     const row = db.prepare('SELECT id,email,role,name,phone,telegram,locale,email_verified_at FROM users WHERE id=?').get(actor.id) as any;
     return { id: row.id, email: row.email, role: row.role, name: row.name, phone: row.phone, telegram: row.telegram, locale: row.locale,
-      emailVerified: Boolean(row.email_verified_at), accountDeletionAvailable: actor.role === 'customer' && Boolean(deleteCustomer) };
+      emailVerified: Boolean(row.email_verified_at), accountDeletionAvailable: actor.role === 'customer' && Boolean(deleteCustomer) && selfServiceDeletionEnabled };
   });
   app.patch('/api/v1/me', async (request, reply) => {
     const actor = auth(request, reply); if (!actor) return;
@@ -550,7 +550,7 @@ export function buildApp({ db, origin, secureCookies = false, requireEmailVerifi
   });
   app.delete('/api/v1/me', async (request, reply) => {
     const actor = auth(request, reply, 'customer'); if (!actor) return;
-    if (!deleteCustomer) return fail(reply, 503, 'Видалення акаунта тимчасово недоступне.');
+    if (!deleteCustomer || !selfServiceDeletionEnabled) return fail(reply, 503, 'Видалення акаунта тимчасово недоступне.');
     const body = parse(z.object({ password: z.string().min(1).max(200) }).strict(), request.body, reply); if (!body) return;
     const row = db.prepare('SELECT password_hash FROM users WHERE id=?').get(actor.id) as { password_hash: string };
     if (!await verifyPassword(body.password, row.password_hash)) return fail(reply, 401, 'Невірний пароль.');
@@ -657,10 +657,17 @@ export function buildApp({ db, origin, secureCookies = false, requireEmailVerifi
       // Перше повідомлення в чаті з'являється одразу після створення заявки —
       // клієнту не потрібно спочатку писати першому, щоб побачити відповідь.
       const inserted = insertChatAutoReply(db, conversationId, requestId, locale, timestamp);
+      // Автовідповідь — це непрочитане вхідне повідомлення для клієнта,
+      // тож вона має з'являтися і в дзвіночку, а не тільки в лічильнику чату.
+      if (inserted) db.prepare('INSERT INTO notifications(id,recipient_id,request_id,kind,status,created_at) VALUES (?,?,?,\'message\',NULL,?)')
+        .run(randomUUID(), actor.id, requestId, timestamp);
       db.prepare('INSERT INTO request_events(id,request_id,actor_id,old_status,new_status,reason,created_at) VALUES (?,?,?,NULL,?,?,?)').run(randomUUID(), requestId, actor.id, 'submitted', '', timestamp);
       audit(db, actor.id, 'request.created', 'request', requestId);
       return inserted;
     })();
+    // Нова заявка створює діалог із першим повідомленням — інакше 10-секундний
+    // кеш /notifications/unread-count віддавав би застарілий 0 після SSE-події.
+    unreadCache.clear();
     // Адміни бачать нову заявку, клієнт — перше повідомлення в діалозі одразу.
     chatEvents.publish(actor.id, { kind: 'request', requestId });
     if (greeted) chatEvents.publish(actor.id, { kind: 'message', requestId });
@@ -671,9 +678,10 @@ export function buildApp({ db, origin, secureCookies = false, requireEmailVerifi
     const query = parse(page, request.query, reply); if (!query) return;
     const items = db.prepare(`SELECT r.id,r.template_id templateId,r.template_name templateName,r.status,r.created_at createdAt,r.updated_at updatedAt,u.locale customerLocale,
       (SELECT m.body FROM messages m WHERE m.conversation_id=c.id ORDER BY m.id DESC LIMIT 1) lastMessage,
-      (SELECT m.created_at FROM messages m WHERE m.conversation_id=c.id ORDER BY m.id DESC LIMIT 1) lastMessageAt
+      (SELECT m.created_at FROM messages m WHERE m.conversation_id=c.id ORDER BY m.id DESC LIMIT 1) lastMessageAt,
+      EXISTS(SELECT 1 FROM conversation_reads cr WHERE cr.conversation_id=c.id AND cr.user_id=?) seen
       FROM requests r JOIN conversations c ON c.request_id=r.id JOIN users u ON u.id=r.customer_id
-      WHERE r.customer_id=? ORDER BY r.created_at DESC,r.id DESC LIMIT ? OFFSET ?`).all(actor.id, query.limit, query.offset);
+      WHERE r.customer_id=? ORDER BY r.created_at DESC,r.id DESC LIMIT ? OFFSET ?`).all(actor.id, actor.id, query.limit, query.offset);
     return { items, nextOffset: (items as unknown[]).length === query.limit ? query.offset + query.limit : null };
   });
   app.get('/api/v1/requests/:id', async (request, reply) => {
@@ -858,11 +866,23 @@ export function buildApp({ db, origin, secureCookies = false, requireEmailVerifi
       .get(customerId, customerId, customerId) as CustomerStats;
     return { ...row, requests, configurations, stats };
   });
+  app.delete('/api/v1/admin/customers/:id', async (request, reply) => {
+    const actor = auth(request, reply, 'admin'); if (!actor) return;
+    const customerId = (request.params as { id: string }).id;
+    if (!id.safeParse(customerId).success) return fail(reply, 422, 'Невірний ідентифікатор.');
+    const customer = db.prepare("SELECT id,email FROM users WHERE id=? AND role='customer'").get(customerId) as { id: string; email: string } | undefined;
+    if (!customer) return fail(reply, 404, 'Не знайдено.');
+    if (!deleteCustomer) return fail(reply, 503, 'Видалення акаунта тимчасово недоступне.');
+    await deleteCustomer(customerId);
+    unreadCache.delete(customerId);
+    audit(db, actor.id, 'customer.delete', 'user', customerId);
+    return reply.code(204).send();
+  });
   app.get('/api/v1/admin/requests', async (request, reply) => {
-    if (!auth(request, reply, 'admin')) return;
+    const actor = auth(request, reply, 'admin'); if (!actor) return;
     const query = parse(page.extend({ status: z.enum(statuses).optional() }), request.query, reply); if (!query) return;
-    const sql = `SELECT r.id,r.customer_id customerId,u.name customerName,u.locale customerLocale,r.template_id templateId,r.template_name templateName,r.status,r.status_version statusVersion,r.created_at createdAt,r.updated_at updatedAt,(SELECT m.body FROM messages m WHERE m.conversation_id=c.id ORDER BY m.id DESC LIMIT 1) lastMessage,(SELECT m.created_at FROM messages m WHERE m.conversation_id=c.id ORDER BY m.id DESC LIMIT 1) lastMessageAt FROM requests r JOIN users u ON u.id=r.customer_id JOIN conversations c ON c.request_id=r.id`;
-    const items = query.status ? db.prepare(`${sql} WHERE r.status=? ORDER BY r.updated_at DESC,r.id DESC LIMIT ? OFFSET ?`).all(query.status, query.limit, query.offset) : db.prepare(`${sql} ORDER BY r.updated_at DESC,r.id DESC LIMIT ? OFFSET ?`).all(query.limit, query.offset);
+    const sql = `SELECT r.id,r.customer_id customerId,u.name customerName,u.locale customerLocale,r.template_id templateId,r.template_name templateName,r.status,r.status_version statusVersion,r.created_at createdAt,r.updated_at updatedAt,(SELECT m.body FROM messages m WHERE m.conversation_id=c.id ORDER BY m.id DESC LIMIT 1) lastMessage,(SELECT m.created_at FROM messages m WHERE m.conversation_id=c.id ORDER BY m.id DESC LIMIT 1) lastMessageAt,EXISTS(SELECT 1 FROM conversation_reads cr WHERE cr.conversation_id=c.id AND cr.user_id=?) seen FROM requests r JOIN users u ON u.id=r.customer_id JOIN conversations c ON c.request_id=r.id`;
+    const items = query.status ? db.prepare(`${sql} WHERE r.status=? ORDER BY r.updated_at DESC,r.id DESC LIMIT ? OFFSET ?`).all(actor.id, query.status, query.limit, query.offset) : db.prepare(`${sql} ORDER BY r.updated_at DESC,r.id DESC LIMIT ? OFFSET ?`).all(actor.id, query.limit, query.offset);
     return { items, nextOffset: (items as unknown[]).length === query.limit ? query.offset + query.limit : null };
   });
   app.patch('/api/v1/admin/requests/:id/status', async (request, reply) => {

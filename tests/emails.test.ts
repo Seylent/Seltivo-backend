@@ -10,8 +10,9 @@ test('verification email has the branded code card and a plain-text fallback', (
   assert.match(mail.html, /Підтвердіть пошту/);
   assert.match(mail.html, /Введіть цей код/);
   assert.match(mail.html, /482&nbsp;731/);
-  assert.match(mail.html, /logo-text-only\.webp/);
-  assert.match(mail.html, /selti\.webp/);
+  assert.match(mail.html, /logo-text-only-email\.png/);
+  assert.match(mail.html, /selti-email\.png/);
+  assert.doesNotMatch(mail.html, /\.webp/);
   assert.match(mail.html, /role="presentation"/);
   assert.match(mail.html, /text\/html|doctype html/i);
   assert.doesNotMatch(mail.html, /<script/i);

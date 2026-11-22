@@ -20,6 +20,11 @@ export type EmailParams = {
 export type RenderedEmail = { subject: string; text: string; html: string };
 
 const ASSET_ORIGIN = 'https://seltivostudio.com';
+// Поштові клієнти (Gmail iOS, Apple Mail, Outlook) погано підтримують WebP з
+// альфою: прозорі пікселі з RGB=(0,0,0) стають суцільним чорним прямокутником.
+// Для листів використовуємо PNG, злиті з білим тлом картки.
+const EMAIL_LOGO = `${ASSET_ORIGIN}/logo-text-only-email.png`;
+const EMAIL_MASCOT = `${ASSET_ORIGIN}/selti-email.png`;
 const INK = '#111111';
 const MUTED = '#6B6B6B';
 const SOFT = '#F4F4F4';
@@ -157,10 +162,10 @@ function layout(locale: EmailLocale, copy: Copy, content: string, origin: string
 <tr><td class="wrap" align="center" style="padding:32px 16px;">
   <table role="presentation" class="card" width="600" cellpadding="0" cellspacing="0" border="0" style="width:100%;max-width:600px;background:#FFFFFF;border:1px solid ${LINE};border-radius:24px;border-collapse:separate;border-spacing:0;">
     <tr><td align="center" style="padding:38px 24px 0;">
-      <img class="logo" src="${ASSET_ORIGIN}/logo-text-only.webp" width="152" alt="SELTIVO" style="display:block;width:152px;height:auto;border:0;">
+      <img class="logo" src="${EMAIL_LOGO}" width="152" alt="SELTIVO" style="display:block;width:152px;height:auto;border:0;">
     </td></tr>
     <tr><td align="center" style="padding:14px 0 0;">
-      <img class="mascot" src="${ASSET_ORIGIN}/selti.webp" width="126" alt="" style="display:block;width:126px;height:auto;border:0;">
+      <img class="mascot" src="${EMAIL_MASCOT}" width="126" alt="" style="display:block;width:126px;height:auto;border:0;">
     </td></tr>
     ${content}
     <tr><td align="center" style="padding:26px 32px 32px;border-top:1px solid ${LINE};font-family:${FONT};font-size:12px;line-height:1.7;color:#9A9A9A;">

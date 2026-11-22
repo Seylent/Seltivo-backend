@@ -91,6 +91,20 @@ export class SeltivoData extends DurableObject<Env> {
     if (requireEmailVerification && !sendMail) {
       throw new Error('SELTIVO_REQUIRE_EMAIL_VERIFICATION=1 requires BREVO_API_KEY and BREVO_SENDER_EMAIL');
     }
+    // Журнал видалень доступний завжди: адміністратор може видаляти акаунти
+    // незалежно від прапорця самообслуговування DELETE /me.
+    const deleteCustomer = async (userId: string) => {
+      try {
+        const response = await ledger.fetch(new Request('https://ledger.internal/deletions', {
+          method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ id: userId }),
+        }));
+        if (!response.ok) throw new Error('Deletion ledger unavailable');
+        purgeCustomer(db, userId);
+      } catch (error) {
+        ctx.abort();
+        throw error;
+      }
+    };
     this.app = buildApp({
       db,
       origin: env.SELTIVO_PUBLIC_ORIGIN,
@@ -102,18 +116,8 @@ export class SeltivoData extends DurableObject<Env> {
       sendMail,
       teamEmail: env.SELTIVO_ADMIN_EMAIL,
       databaseBytes: () => ctx.storage.sql.databaseSize,
-      deleteCustomer: env.SELTIVO_ACCOUNT_DELETION_ENABLED === '1' ? async (userId) => {
-        try {
-          const response = await ledger.fetch(new Request('https://ledger.internal/deletions', {
-            method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ id: userId }),
-          }));
-          if (!response.ok) throw new Error('Deletion ledger unavailable');
-          purgeCustomer(db, userId);
-        } catch (error) {
-          ctx.abort();
-          throw error;
-        }
-      } : undefined,
+      deleteCustomer,
+      selfServiceDeletionEnabled: env.SELTIVO_ACCOUNT_DELETION_ENABLED === '1',
     });
   }
 

@@ -19,12 +19,18 @@ const smtp = process.env.SMTP_HOST && process.env.SMTP_USER && process.env.SMTP_
       auth: { user: process.env.SMTP_USER, pass: process.env.SMTP_PASSWORD },
     }) : null;
 const devMail = process.env.NODE_ENV !== 'production' && process.env.SELTIVO_DEV_MAIL === 'console';
-const deletionEnabled = process.env.SELTIVO_ACCOUNT_DELETION_ENABLED === '1';
-if (deletionEnabled) {
-  // Після restore старої БД видалені акаунти мають зникнути знову.
-  const replayed = replayLocalDeletions(db);
-  if (replayed) console.log(`Replayed ${replayed} local account deletion(s).`);
-}
+const selfServiceDeletionEnabled = process.env.SELTIVO_ACCOUNT_DELETION_ENABLED === '1';
+// Після restore старої БД видалені акаунти мають зникнути знову — це стосується
+// і видалень, зроблених адміністратором, навіть коли самообслуговування вимкнено.
+const replayed = replayLocalDeletions(db);
+if (replayed) console.log(`Replayed ${replayed} local account deletion(s).`);
+// Журнал доступний завжди: administrator може видаляти акаунти незалежно від
+// прапорця самообслуговування. Сам прапорець контролює лише DELETE /me.
+const deleteCustomer = async (userId: string) => {
+  // Спочатку журнал: якщо purge впаде, наступний старт доробить видалення.
+  recordLocalDeletion(userId);
+  purgeCustomer(db, userId);
+};
 const app = buildApp({
   db,
   origin,
@@ -32,14 +38,8 @@ const app = buildApp({
   requireAdmin2FA: process.env.SELTIVO_REQUIRE_ADMIN_2FA === '1',
   teamEmail: process.env.SELTIVO_TEAM_EMAIL,
   databaseBytes: () => (db.pragma('page_count', { simple: true }) as number) * (db.pragma('page_size', { simple: true }) as number),
-  // Як і Worker, локальний сервер не видаляє акаунти без явного прапорця.
-  deleteCustomer: deletionEnabled
-    ? async (userId) => {
-        // Спочатку журнал: якщо purge впаде, наступний старт доробить видалення.
-        recordLocalDeletion(userId);
-        purgeCustomer(db, userId);
-      }
-    : undefined,
+  deleteCustomer,
+  selfServiceDeletionEnabled,
   sendMail: smtp ? async (to, subject, text, html) => { await smtp.sendMail({ from: process.env.SMTP_FROM, to, subject, text, ...(html ? { html } : {}) }); }
     : devMail ? async (to, subject, text) => {
       // Dev-консоль часто потрапляє в логи — токени з посилань друкувати не можна.

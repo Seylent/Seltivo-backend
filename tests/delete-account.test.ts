@@ -73,6 +73,44 @@ test('customer deletion removes related data and the external ledger prevents ba
   }
 });
 
+test('admin can delete a customer even when self-service deletion is disabled', async () => {
+  const db = openDatabase(':memory:');
+  const deleted: string[] = [];
+  const app = buildApp({ db, origin, logger: false,
+    deleteCustomer: async (userId) => { deleted.push(userId); purgeCustomer(db, userId); },
+    selfServiceDeletionEnabled: false });
+  const call = async (method: string, url: string, payload?: unknown, cookie?: string) => {
+    const response = await app.inject({ method: method as 'GET', url, headers: { origin, ...(cookie ? { cookie } : {}) }, payload } as any);
+    return { status: response.statusCode, body: response.body ? JSON.parse(response.body) : null, cookie: response.headers['set-cookie'] as string | undefined };
+  };
+  try {
+    const email = 'admin-delete@example.test';
+    const password = 'VeryStrongPass123!';
+    const registered = await call('POST', '/api/v1/auth/register', { email, password, name: 'Customer' });
+    assert.equal(registered.status, 201);
+    const customerId = (db.prepare('SELECT id FROM users WHERE email=?').get(email) as { id: string }).id;
+    const customer = (await call('POST', '/api/v1/auth/login', { email, password })).cookie!.split(';')[0];
+    const timestamp = now();
+    db.prepare("INSERT INTO users(id,email,password_hash,role,name,email_verified_at,created_at,updated_at) VALUES (?,?,?,'admin','Admin',?,?,?)")
+      .run(randomUUID(), 'admin@example.test', await hashPassword(password), timestamp, timestamp, timestamp);
+    const admin = (await call('POST', '/api/v1/auth/login', { email: 'admin@example.test', password })).cookie!.split(';')[0];
+
+    assert.equal((await call('GET', '/api/v1/me', undefined, customer)).body.accountDeletionAvailable, false);
+    assert.equal((await call('DELETE', '/api/v1/me', { password }, customer)).status, 503);
+    assert.equal((await call('DELETE', `/api/v1/admin/customers/${customerId}`, undefined, customer)).status, 403);
+    assert.equal((await call('DELETE', '/api/v1/admin/customers/not-a-uuid', undefined, admin)).status, 422);
+    assert.equal((await call('DELETE', `/api/v1/admin/customers/${randomUUID()}`, undefined, admin)).status, 404);
+
+    assert.equal((await call('DELETE', `/api/v1/admin/customers/${customerId}`, undefined, admin)).status, 204);
+    assert.deepEqual(deleted, [customerId]);
+    assert.equal((db.prepare('SELECT COUNT(*) count FROM users WHERE id=?').get(customerId) as { count: number }).count, 0);
+    assert.equal((await call('GET', `/api/v1/admin/customers/${customerId}`, undefined, admin)).status, 404);
+    const audit = db.prepare("SELECT actor_id actorId,action,entity_id entityId FROM audit_log WHERE action='customer.delete'").get() as { actorId: string; action: string; entityId: string } | undefined;
+    assert.equal(audit?.entityId, customerId);
+    assert.notEqual(audit?.actorId, customerId);
+  } finally { await app.close(); db.close(); }
+});
+
 test('account deletion stays unavailable without the external ledger', async () => {
   const db = openDatabase(':memory:');
   const app = buildApp({ db, origin, logger: false });
