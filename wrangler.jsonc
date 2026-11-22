@@ -4,7 +4,8 @@
   "account_id": "642a1378267910de72f484b86dd6eb73",
   "main": "./cloudflare/worker.ts",
   "compatibility_date": "2026-11-14",
-  "workers_dev": true,
+  "workers_dev": false,
+  "preview_urls": false,
   "vars": {
     "SELTIVO_PUBLIC_ORIGIN": "https://seltivostudio.com",
     "SELTIVO_ADMIN_EMAIL": "seltivostudio@gmail.com",
@@ -27,6 +28,8 @@
   "observability": { "enabled": true, "redact_query_string": true },
   "env": {
     "staging": {
+      "workers_dev": false,
+      "preview_urls": false,
       "vars": {
         "SELTIVO_PUBLIC_ORIGIN": "https://seltivo-staging.seltivostudio.workers.dev",
         "SELTIVO_ADMIN_EMAIL": "seltivostudio@gmail.com",
