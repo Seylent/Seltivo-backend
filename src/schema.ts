@@ -134,4 +134,7 @@ export const MIGRATIONS = [
   { version: 7, sql: `
     ALTER TABLE guest_requests ADD COLUMN trial_json TEXT;
   ` },
+  { version: 8, sql: `
+    ALTER TABLE auth_tokens ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0;
+  ` },
 ] as const;

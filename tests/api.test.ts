@@ -4,6 +4,7 @@ import { test } from 'node:test';
 import { buildApp } from '../src/app.js';
 import { hashPassword, now } from '../src/auth.js';
 import { openDatabase } from '../src/db.js';
+import { createWorkerRouter } from '../cloudflare/worker-router.js';
 
 process.env.NODE_ENV = 'test';
 const origin = 'http://localhost:3000';
@@ -211,8 +212,45 @@ test('profile update, password change, password reset and email verification flo
     db.prepare('UPDATE users SET email_verified_at=NULL WHERE id=?').run(reg.body.id);
     assert.equal((await call('POST', '/api/v1/auth/resend-verification', { email: 'flow@example.test' })).status, 202);
     assert.equal(sent.length, 3);
-    const verifyToken = new URL(sent[2].text.split(': ').pop()!).searchParams.get('token')!;
-    assert.equal((await call('POST', '/api/v1/auth/verify-email', { token: verifyToken })).status, 200);
-    assert.equal((await call('POST', '/api/v1/auth/verify-email', { token: verifyToken })).status, 422);
+    const verifyCode = sent[2].text.match(/\b\d{6}\b/)?.[0];
+    assert.ok(verifyCode);
+    assert.equal((await call('POST', '/api/v1/auth/verify-email', { email: 'flow@example.test', code: verifyCode })).status, 200);
+    assert.equal((await call('POST', '/api/v1/auth/verify-email', { email: 'flow@example.test', code: verifyCode })).status, 422);
   } finally { await app.close(); db.close(); }
+});
+
+test('email code gates login, expires, limits guesses and is consumed once', async () => {
+  const db = openDatabase(':memory:');
+  const sent: string[] = [];
+  const app = buildApp({ db, origin, logger: false, router: createWorkerRouter(), requireEmailVerification: true, sendMail: async (_to, _subject, text) => { sent.push(text); } });
+  let requestCount = 0;
+  const call = async (url: string, payload: unknown) => {
+    const response = await app.inject({ method: 'POST', url, headers: { origin, 'cf-connecting-ip': `203.0.113.${++requestCount}` }, payload: Buffer.from(JSON.stringify(payload)) });
+    return response.statusCode;
+  };
+  const email = 'code@example.test';
+  const login = () => call('/api/v1/auth/login', { email, password: 'InitialPassword123!' });
+  const verify = (code: string) => call('/api/v1/auth/verify-email', { email, code });
+  try {
+    assert.equal(await call('/api/v1/auth/register', { email, password: 'InitialPassword123!', name: 'Code User' }), 201);
+    assert.equal(await login(), 403);
+    const firstCode = sent[0].match(/\b\d{6}\b/)?.[0];
+    assert.ok(firstCode);
+    assert.equal(await verify(firstCode === '000000' ? '000001' : '000000'), 422);
+    db.prepare("UPDATE auth_tokens SET expires_at=? WHERE purpose='verify'").run('2000-01-01T00:00:00.000Z');
+    assert.equal(await verify(firstCode), 422);
+    assert.equal(await call('/api/v1/auth/resend-verification', { email }), 202);
+    const secondCode = sent[1].match(/\b\d{6}\b/)?.[0];
+    assert.ok(secondCode);
+    assert.equal(await verify(firstCode), 422);
+    const wrong = secondCode === '000000' ? '000001' : '000000';
+    for (let i = 0; i < 4; i++) assert.equal(await verify(wrong), 422);
+    assert.equal(await verify(secondCode), 429);
+    assert.equal(await call('/api/v1/auth/resend-verification', { email }), 202);
+    const thirdCode = sent[2].match(/\b\d{6}\b/)?.[0];
+    assert.ok(thirdCode);
+    assert.equal(await verify(thirdCode), 200);
+    assert.equal(await verify(thirdCode), 422);
+    assert.equal(await login(), 200);
+  } finally { db.close(); }
 });

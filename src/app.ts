@@ -2,7 +2,7 @@ import { randomUUID } from 'node:crypto';
 import Fastify, { type FastifyInstance, type FastifyReply, type FastifyRequest } from 'fastify';
 import { z } from 'zod';
 import type { SeltivoDb } from './db.js';
-import { actorFromRequest, audit, clearSessionCookie, createSession, hashPassword, hashToken, newAuthToken, normalizeEmail, now, sessionCookie, sessionTokenFromRequest, verifyPassword, type Actor } from './auth.js';
+import { actorFromRequest, audit, clearSessionCookie, createSession, hashPassword, hashToken, newAuthToken, newEmailCode, normalizeEmail, now, sessionCookie, sessionTokenFromRequest, verifyPassword, type Actor } from './auth.js';
 import { generateRecoveryCodes, generateTotpSecret, normalizeRecoveryCode, otpauthUri, verifyTotp } from './two-factor.js';
 import { trialSnapshot } from './trial.js';
 import { createChatEvents } from './chat-events.js';
@@ -279,8 +279,8 @@ export function buildApp({ db, origin, secureCookies = false, requireEmailVerifi
       throw error;
     }
     if (requireEmailVerification && sendMail) {
-      const token = newAuthToken(db, userId, 'verify', 24 * 60 * 60 * 1000);
-      await mail(normalized, 'Підтвердьте email SELTIVO', `${origin}/verify-email?token=${token}`);
+      const code = newEmailCode(db, userId);
+      await mail(normalized, 'Код підтвердження SELTIVO', `Ваш код підтвердження SELTIVO: ${code}\n\nКод дійсний 10 хвилин. Якщо ви не створювали акаунт, проігноруйте цей лист.`);
     }
     return reply.code(201).send({ id: userId, verificationRequired: requireEmailVerification });
   });
@@ -295,19 +295,35 @@ export function buildApp({ db, origin, secureCookies = false, requireEmailVerifi
     recordAttempt(limitKey, 15 * 60_000);
     const user = db.prepare('SELECT id,email,email_verified_at FROM users WHERE email=? AND disabled_at IS NULL').get(normalized) as any;
     if (user && !user.email_verified_at && sendMail) {
-      const token = newAuthToken(db, user.id, 'verify', 24 * 60 * 60 * 1000);
-      await mail(user.email, 'Підтвердьте email SELTIVO', `${origin}/verify-email?token=${token}`);
+      const code = newEmailCode(db, user.id);
+      await mail(user.email, 'Код підтвердження SELTIVO', `Ваш новий код підтвердження SELTIVO: ${code}\n\nКод дійсний 10 хвилин. Якщо ви не створювали акаунт, проігноруйте цей лист.`);
     }
     return reply.code(202).send({ ok: true });
   });
   app.post('/api/v1/auth/verify-email', async (request, reply) => {
-    const body = parse(z.object({ token: z.string().min(20).max(100) }).strict(), request.body, reply);
+    const body = parse(z.union([
+      z.object({ email, code: z.string().regex(/^\d{6}$/) }).strict(),
+      z.object({ token: z.string().min(20).max(100) }).strict(),
+    ]), request.body, reply);
     if (!body) return;
-    const row = db.prepare("SELECT user_id FROM auth_tokens WHERE token_hash=? AND purpose='verify' AND expires_at>?").get(hashToken(body.token), now()) as { user_id: string } | undefined;
-    if (!row) return fail(reply, 422, 'Посилання недійсне або прострочене.');
+    let row: { user_id: string; token_hash: string } | undefined;
+    if ('code' in body) {
+      const normalized = normalizeEmail(body.email);
+      const user = db.prepare("SELECT id FROM users WHERE email=? AND role='customer' AND disabled_at IS NULL AND email_verified_at IS NULL").get(normalized) as { id: string } | undefined;
+      const token = user && db.prepare("SELECT token_hash,attempts FROM auth_tokens WHERE user_id=? AND purpose='verify' AND expires_at>?").get(user.id, now()) as { token_hash: string; attempts: number } | undefined;
+      if (token && token.attempts >= 5) return fail(reply, 429, 'Забагато спроб. Запросіть новий код.');
+      if (token) {
+        const supplied = hashToken(`${user!.id}:${body.code}`);
+        if (supplied === token.token_hash) row = { user_id: user!.id, token_hash: token.token_hash };
+        else db.prepare('UPDATE auth_tokens SET attempts=attempts+1 WHERE token_hash=?').run(token.token_hash);
+      }
+    } else {
+      row = db.prepare("SELECT user_id,token_hash FROM auth_tokens WHERE token_hash=? AND purpose='verify' AND expires_at>?").get(hashToken(body.token), now()) as typeof row;
+    }
+    if (!row) return fail(reply, 422, 'Код недійсний або прострочений.');
     db.transaction(() => {
       db.prepare('UPDATE users SET email_verified_at=?,updated_at=? WHERE id=?').run(now(), now(), row.user_id);
-      db.prepare('DELETE FROM auth_tokens WHERE token_hash=?').run(hashToken(body.token));
+      db.prepare("DELETE FROM auth_tokens WHERE user_id=? AND purpose='verify'").run(row.user_id);
     })();
     return { ok: true };
   });
@@ -343,6 +359,7 @@ export function buildApp({ db, origin, secureCookies = false, requireEmailVerifi
       recordAttempt(emailLimitKey, 15 * 60_000);
       return fail(reply, 401, 'Невірний email або пароль.');
     }
+    if (requireEmailVerification && user.role === 'customer' && !user.email_verified_at) return fail(reply, 403, 'Підтвердьте email кодом із листа.');
     let updatedRecoveryCodes: string | null = null;
     if (user.role === 'admin') {
       const factor = twoFactorRow(user.id);

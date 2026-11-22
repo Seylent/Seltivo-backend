@@ -1,4 +1,4 @@
-import { createHash, randomBytes, randomUUID, scrypt as scryptCallback, timingSafeEqual } from 'node:crypto';
+import { createHash, randomBytes, randomInt, randomUUID, scrypt as scryptCallback, timingSafeEqual } from 'node:crypto';
 import { promisify } from 'node:util';
 import type { FastifyRequest } from 'fastify';
 import type { SeltivoDb } from './db.js';
@@ -78,6 +78,15 @@ export function newAuthToken(db: SeltivoDb, userId: string, purpose: 'verify' | 
   db.prepare('INSERT INTO auth_tokens(token_hash,user_id,purpose,expires_at,created_at) VALUES (?,?,?,?,?)')
     .run(hashToken(token), userId, purpose, new Date(Date.now() + ttlMs).toISOString(), timestamp);
   return token;
+}
+
+export function newEmailCode(db: SeltivoDb, userId: string) {
+  const timestamp = now();
+  db.prepare("DELETE FROM auth_tokens WHERE (user_id=? AND purpose='verify') OR expires_at<=?").run(userId, timestamp);
+  const code = randomInt(0, 1_000_000).toString().padStart(6, '0');
+  db.prepare("INSERT INTO auth_tokens(token_hash,user_id,purpose,expires_at,created_at) VALUES (?,?,'verify',?,?)")
+    .run(hashToken(`${userId}:${code}`), userId, new Date(Date.now() + 10 * 60_000).toISOString(), timestamp);
+  return code;
 }
 
 export function audit(db: SeltivoDb, actorId: string, action: string, entityType: string, entityId: string) {

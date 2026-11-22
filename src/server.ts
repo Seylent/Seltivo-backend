@@ -43,7 +43,9 @@ const app = buildApp({
   sendMail: smtp ? async (to, subject, text) => { await smtp.sendMail({ from: process.env.SMTP_FROM, to, subject, text }); }
     : devMail ? async (to, subject, text) => {
       // Dev-консоль часто потрапляє в логи — токени з посилань друкувати не можна.
-      const redact = (value: string) => value.replace(/([?&](?:token|code)=)[^\s&]+/gi, '$1***');
+      const redact = (value: string) => value
+        .replace(/([?&](?:token|code)=)[^\s&]+/gi, '$1***')
+        .replace(/(SELTIVO:\s*)\d{6}\b/gi, '$1******');
       console.log(`DEV MAIL to ${to}: ${redact(subject)}\n${redact(text)}`);
     } : undefined,
 });

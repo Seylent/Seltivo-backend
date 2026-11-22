@@ -6,10 +6,9 @@
   "compatibility_date": "2026-11-14",
   "workers_dev": true,
   "vars": {
-    "SELTIVO_PUBLIC_ORIGIN": "https://seltivo.seltivostudio.workers.dev",
+    "SELTIVO_PUBLIC_ORIGIN": "https://seltivostudio.com",
     "SELTIVO_ADMIN_EMAIL": "seltivostudio@gmail.com",
-    // Тимчасово 0: у production немає Brevo-секретів, інакше воркер падає при старті.
-    "SELTIVO_REQUIRE_EMAIL_VERIFICATION": "0",
+    "SELTIVO_REQUIRE_EMAIL_VERIFICATION": "1",
     // Після увімкнення 2FA на всіх адмінських акаунтах виставити "1".
     "SELTIVO_REQUIRE_ADMIN_2FA": "0"
   },
