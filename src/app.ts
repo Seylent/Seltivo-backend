@@ -374,6 +374,10 @@ export function buildApp({ dataLimits, db, origin, secureCookies = false, requir
       db.prepare('UPDATE users SET email_verified_at=?,updated_at=? WHERE id=?').run(now(), now(), row.user_id);
       db.prepare("DELETE FROM auth_tokens WHERE user_id=? AND purpose='verify'").run(row.user_id);
     })();
+    // The one-time verification secret proves email ownership. Customer sessions
+    // are issued here so the browser never needs to persist the account password.
+    const customer = db.prepare("SELECT id FROM users WHERE id=? AND role='customer' AND disabled_at IS NULL").get(row.user_id) as { id: string } | undefined;
+    if (customer) reply.header('Set-Cookie', sessionCookie(createSession(db, customer.id), secureCookies));
     return { ok: true };
   });
   // Гостьові заявки з публічних форм: зберігаємо копію для адмінки.
