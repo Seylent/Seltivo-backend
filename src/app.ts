@@ -156,8 +156,8 @@ export function buildApp({ db, origin, secureCookies = false, requireEmailVerifi
   };
   const unreadCache = new Map<string, { value: unknown; expires: number }>();
   const mail = async (to: string, subject: string, text: string) => {
-    if (!sendMail) return;
-    try { await sendMail(to, subject, text); } catch { app.log.error({ event: 'email_delivery_failed', kind: 'auth' }); }
+    if (!sendMail) return false;
+    try { await sendMail(to, subject, text); return true; } catch { app.log.error({ event: 'email_delivery_failed', kind: 'auth' }); return false; }
   };
   const deliverNotification = async (notificationId: string): Promise<'sent' | 'failed' | 'busy' | 'missing'> => {
     const started = now();
@@ -360,7 +360,18 @@ export function buildApp({ db, origin, secureCookies = false, requireEmailVerifi
       recordAttempt(emailLimitKey, 15 * 60_000);
       return fail(reply, 401, 'Невірний email або пароль.');
     }
-    if (requireEmailVerification && user.role === 'customer' && !user.email_verified_at) return fail(reply, 403, 'Підтвердьте email кодом із листа.');
+    if (requireEmailVerification && user.role === 'customer' && !user.email_verified_at) {
+      const pending = db.prepare("SELECT 1 FROM auth_tokens WHERE user_id=? AND purpose='verify' AND expires_at>?").get(user.id, now());
+      if (!pending) {
+        const limitKey = `email:resend:${normalized}`;
+        if (!checkRateLimit(limitKey, 15 * 60_000, 5, reply, false)) return;
+        recordAttempt(limitKey, 15 * 60_000);
+        const verificationCode = newEmailCode(db, user.id);
+        const sent = await mail(user.email, 'Код підтвердження SELTIVO', `Ваш код підтвердження SELTIVO: ${verificationCode}\n\nКод дійсний 10 хвилин. Якщо ви не створювали акаунт, проігноруйте цей лист.`);
+        if (!sent) return fail(reply, 503, 'Не вдалося надіслати код. Спробуйте ще раз на сторінці підтвердження.');
+      }
+      return fail(reply, 403, 'Підтвердьте email кодом із листа. Якщо листа немає, надішліть код ще раз.');
+    }
     let updatedRecoveryCodes: string | null = null;
     if (user.role === 'admin') {
       const factor = twoFactorRow(user.id);

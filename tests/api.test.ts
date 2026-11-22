@@ -254,3 +254,22 @@ test('email code gates login, expires, limits guesses and is consumed once', asy
     assert.equal(await login(), 200);
   } finally { db.close(); }
 });
+
+test('login sends a code to an existing customer who needs to verify', async () => {
+  const db = openDatabase(':memory:');
+  const sent: string[] = [];
+  const app = buildApp({ db, origin, logger: false, router: createWorkerRouter(), requireEmailVerification: true, sendMail: async (_to, _subject, text) => { sent.push(text); } });
+  const call = (url: string, payload: unknown) => app.inject({ method: 'POST', url, headers: { origin }, payload: Buffer.from(JSON.stringify(payload)) });
+  const email = 'existing@example.test';
+  try {
+    assert.equal((await call('/api/v1/auth/register', { email, password: 'InitialPassword123!', name: 'Existing User' })).statusCode, 201);
+    db.prepare("DELETE FROM auth_tokens WHERE purpose='verify'").run();
+    const login = await call('/api/v1/auth/login', { email, password: 'InitialPassword123!' });
+    assert.equal(login.statusCode, 403);
+    assert.equal(sent.length, 2);
+    const code = sent[1].match(/\b\d{6}\b/)?.[0];
+    assert.ok(code);
+    assert.equal((await call('/api/v1/auth/verify-email', { email, code })).statusCode, 200);
+    assert.equal((await call('/api/v1/auth/login', { email, password: 'InitialPassword123!' })).statusCode, 200);
+  } finally { db.close(); }
+});
