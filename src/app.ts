@@ -6,6 +6,7 @@ import { actorFromRequest, audit, clearSessionCookie, createSession, hashPasswor
 import { generateRecoveryCodes, generateTotpSecret, normalizeRecoveryCode, otpauthUri, verifyTotp } from './two-factor.js';
 import { trialSnapshot } from './trial.js';
 import { createChatEvents } from './chat-events.js';
+import { accountExport } from './account-export.js';
 import { renderEmail } from './emails.js';
 
 const id = z.uuid();
@@ -540,6 +541,15 @@ export function buildApp({ db, origin, secureCookies = false, requireEmailVerifi
     const row = db.prepare('SELECT id,email,role,name,phone,telegram,locale,email_verified_at FROM users WHERE id=?').get(actor.id) as any;
     return { id: row.id, email: row.email, role: row.role, name: row.name, phone: row.phone, telegram: row.telegram, locale: row.locale,
       emailVerified: Boolean(row.email_verified_at), accountDeletionAvailable: actor.role === 'customer' && Boolean(deleteCustomer) };
+  });
+  app.get('/api/v1/me/export', async (request, reply) => {
+    const actor = auth(request, reply, 'customer'); if (!actor) return;
+    if (!checkRateLimit(`EXPORT:${actor.id}`, 60 * 60_000, 3, reply)) return;
+    return reply.header('Content-Type', 'application/json; charset=utf-8')
+      .header('Content-Disposition', 'attachment; filename="seltivo-account.json"')
+      .header('Cache-Control', 'private, no-store, no-transform')
+      .header('X-Content-Type-Options', 'nosniff')
+      .send(accountExport(db, actor.id));
   });
   app.patch('/api/v1/me', async (request, reply) => {
     const actor = auth(request, reply); if (!actor) return;
