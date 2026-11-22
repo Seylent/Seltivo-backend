@@ -196,7 +196,7 @@ export class SeltivoData extends DurableObject<Env> {
         }));
         console.log(JSON.stringify({ event: 'backup_completed', requestId, durationMs: Date.now() - started,
           bytes: result.bytes + site.bytes, siteObjects: site.manifest.objects.length, databaseBytes: this.ctx.storage.sql.databaseSize }));
-        return Response.json({ key: result.key, bytes: result.bytes + site.bytes, serviceManifest });
+        return Response.json({ key: result.key, bytes: result.bytes + site.bytes, serviceManifest, r2Manifest: site.key });
       } catch (error) {
         console.error(JSON.stringify({ event: 'backup_failed', requestId, durationMs: Date.now() - started,
           errorType: error instanceof Error ? error.name : 'unknown' }));

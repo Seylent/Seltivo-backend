@@ -35,6 +35,7 @@
       "preview_urls": false,
       "vars": {
         "SELTIVO_PUBLIC_ORIGIN": "https://seltivo-staging.seltivostudio.workers.dev",
+        "SELTIVO_REQUIRE_EMAIL_VERIFICATION": "0",
         "SELTIVO_ADMIN_EMAIL": "seltivostudio@gmail.com",
         "SELTIVO_REQUIRE_ADMIN_2FA": "0"
       },
