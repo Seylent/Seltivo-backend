@@ -213,6 +213,7 @@ export function buildApp({ db, origin, secureCookies = false, requireEmailVerifi
     const actor = actorFromRequest(db, request);
     if (!actor) { fail(reply, 401, 'Увійдіть до акаунта.'); return null; }
     if (role && actor.role !== role) { fail(reply, 403, 'Недостатньо прав.'); return null; }
+    if (requireEmailVerification && actor.role === 'customer' && !actor.email_verified_at) { fail(reply, 403, 'Підтвердьте email кодом із листа.'); return null; }
     return actor;
   };
   const verified = (actor: Actor, reply: FastifyReply) => {

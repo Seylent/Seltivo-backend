@@ -102,3 +102,26 @@ test('version 1 advances to the latest schema without changing existing records'
     migrated.close();
   } finally { removeTestDirectory(directory); }
 });
+
+test('existing customers must verify again while admin access remains intact', () => {
+  const directory = mkdtempSync(join(tmpdir(), 'seltivo-migration-'));
+  const filename = join(directory, 'reverify.db');
+  try {
+    openDatabase(filename).close();
+    const old = new Database(filename);
+    old.pragma('user_version = 8');
+    for (const [id, role] of [['customer-1', 'customer'], ['admin-1', 'admin']]) {
+      old.prepare('INSERT INTO users(id,email,password_hash,role,name,email_verified_at,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?)')
+        .run(id, `${id}@example.test`, 'hash', role, id, '2026-01-01', '2026-01-01', '2026-01-01');
+      old.prepare('INSERT INTO sessions(token_hash,user_id,expires_at,created_at) VALUES (?,?,?,?)')
+        .run(`${id}-session`, id, '2027-01-01', '2026-01-01');
+    }
+    old.close();
+    const migrated = openDatabase(filename);
+    assert.equal((migrated.prepare("SELECT email_verified_at FROM users WHERE id='customer-1'").get() as { email_verified_at: string | null }).email_verified_at, null);
+    assert.equal((migrated.prepare("SELECT COUNT(*) count FROM sessions WHERE user_id='customer-1'").get() as { count: number }).count, 0);
+    assert.equal((migrated.prepare("SELECT email_verified_at FROM users WHERE id='admin-1'").get() as { email_verified_at: string }).email_verified_at, '2026-01-01');
+    assert.equal((migrated.prepare("SELECT COUNT(*) count FROM sessions WHERE user_id='admin-1'").get() as { count: number }).count, 1);
+    migrated.close();
+  } finally { removeTestDirectory(directory); }
+});

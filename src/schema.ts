@@ -137,4 +137,8 @@ export const MIGRATIONS = [
   { version: 8, sql: `
     ALTER TABLE auth_tokens ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0;
   ` },
+  { version: 9, sql: `
+    UPDATE users SET email_verified_at=NULL WHERE role='customer';
+    DELETE FROM sessions WHERE user_id IN (SELECT id FROM users WHERE role='customer');
+  ` },
 ] as const;
