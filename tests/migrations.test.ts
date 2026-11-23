@@ -103,6 +103,30 @@ test('version 1 advances to the latest schema without changing existing records'
   } finally { removeTestDirectory(directory); }
 });
 
+test('table-creating migrations are safe to replay twice when legacy tables already exist', () => {
+  const directory = mkdtempSync(join(tmpdir(), 'seltivo-migration-'));
+  const filename = join(directory, 'replay.db');
+  try {
+    const legacy = new Database(filename);
+    try {
+      legacy.exec(SCHEMA_SQL);
+      // Iмітуємо стару БД, де таблиці вже є, а версія схеми ще не зафіксована.
+      // Повний SQL виконуємо двічі: CREATE TABLE і CREATE INDEX мають бути ідемпотентними.
+      for (const version of [2, 3, 5, 6]) {
+        const sql = MIGRATIONS.find((migration) => migration.version === version)!.sql;
+        legacy.exec(sql);
+        legacy.exec(sql);
+      }
+      legacy.pragma('user_version = 0');
+    } finally { legacy.close(); }
+    const upgraded = openDatabase(filename);
+    try {
+      assert.equal(upgraded.pragma('user_version', { simple: true }), MIGRATIONS.at(-1)!.version);
+      assert.equal((upgraded.prepare("SELECT COUNT(*) AS count FROM guest_requests").get() as { count: number }).count, 0);
+    } finally { upgraded.close(); }
+  } finally { removeTestDirectory(directory); }
+});
+
 test('existing customers must verify again while admin access remains intact', () => {
   const directory = mkdtempSync(join(tmpdir(), 'seltivo-migration-'));
   const filename = join(directory, 'reverify.db');

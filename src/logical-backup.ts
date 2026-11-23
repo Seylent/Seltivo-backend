@@ -10,15 +10,16 @@ const tables = [
 ] as const;
 type Table = typeof tables[number];
 type Row = Record<string, string | number | null>;
-type Store = {
+export type Store = {
   put(key: string, value: string): Promise<unknown>;
   get(key: string): Promise<{ text(): Promise<string> } | null>;
 };
-type Chunk = { key: string; table: Table; rows: number; bytes: number; sha256: string };
+type Chunk = { key: string; table: Table; rows: number; bytes: number; sha256: string; iv?: string };
 export type BackupManifest = {
   format: 'seltivo-logical-v1';
   createdAt: string;
   schemaVersion: number;
+  encryption?: 'aes-gcm-256';
   chunks: Chunk[];
   rowCounts: Record<Table, number>;
 };
@@ -51,6 +52,41 @@ async function sha256(value: string): Promise<string> {
   return [...new Uint8Array(digest)].map((byte) => byte.toString(16).padStart(2, '0')).join('');
 }
 
+const encryptionMarker = 'aes-gcm-256' as const;
+const invalidKeyError = 'Backup encryption key must be a base64-encoded 32-byte key';
+
+function bytesToBase64(bytes: Uint8Array): string {
+  let binary = '';
+  for (let offset = 0; offset < bytes.length; offset += 0x8000) {
+    binary += String.fromCharCode(...bytes.subarray(offset, offset + 0x8000));
+  }
+  return btoa(binary);
+}
+
+function base64ToBytes(value: string): Uint8Array {
+  const binary = atob(value.replace(/-/g, '+').replace(/_/g, '/'));
+  const bytes = new Uint8Array(binary.length);
+  for (let index = 0; index < binary.length; index += 1) bytes[index] = binary.charCodeAt(index);
+  return bytes;
+}
+
+function encryptionKeyBytes(key: string): Uint8Array {
+  const normalized = key.replace(/-/g, '+').replace(/_/g, '/');
+  if (!/^[A-Za-z0-9+/]+={0,2}$/.test(normalized)) throw new Error(invalidKeyError);
+  let bytes: Uint8Array;
+  try {
+    bytes = base64ToBytes(normalized + '='.repeat((4 - normalized.length % 4) % 4));
+  } catch {
+    throw new Error(invalidKeyError);
+  }
+  if (bytes.byteLength !== 32) throw new Error(invalidKeyError);
+  return bytes;
+}
+
+async function aesGcmKey(raw: Uint8Array): Promise<CryptoKey> {
+  return crypto.subtle.importKey('raw', new Uint8Array(raw), { name: 'AES-GCM' }, false, ['encrypt', 'decrypt']);
+}
+
 function rowsFor(db: SeltivoDb, table: Table, limit: number, offset: number): Row[] {
   const rows = db.prepare(`SELECT * FROM ${table} ORDER BY rowid LIMIT ? OFFSET ?`).all(limit, offset) as Row[];
   for (const row of rows) {
@@ -63,24 +99,35 @@ function rowsFor(db: SeltivoDb, table: Table, limit: number, offset: number): Ro
 
 // Each chunk is independent and the manifest is written only after a consistent read.
 // Incomplete runs leave orphan chunks, which the 30-day R2 lifecycle removes.
-export async function createLogicalBackup(db: SeltivoDb, store: Store, at = new Date()): Promise<{ key: string; manifest: BackupManifest; bytes: number }> {
+export async function createLogicalBackup(db: SeltivoDb, store: Store, at = new Date(), encryptionKey?: string): Promise<{ key: string; manifest: BackupManifest; bytes: number }> {
   assertSchema(db);
+  const cryptoKey = encryptionKey === undefined ? null : await aesGcmKey(encryptionKeyBytes(encryptionKey));
   const startedAt = changes(db);
   const base = `${prefix}${at.toISOString().slice(0, 10)}/${randomUUID()}/`;
   const manifest: BackupManifest = {
     format: 'seltivo-logical-v1', createdAt: at.toISOString(), schemaVersion: latestVersion,
+    ...(cryptoKey ? { encryption: encryptionMarker } : {}),
     chunks: [], rowCounts: Object.fromEntries(tables.map((table) => [table, 0])) as Record<Table, number>,
   };
   const maxChunkBytes = 16 * 1024 * 1024;
   const targetChunkBytes = 8 * 1024 * 1024;
   let totalBytes = 0;
   const flushChunk = async (table: Table, chunkIndex: number, rows: Row[]) => {
-    const data = JSON.stringify(rows);
-    const bytes = encoder.encode(data).byteLength;
+    const plaintext = JSON.stringify(rows);
+    const checksum = await sha256(plaintext);
+    let stored = plaintext;
+    let iv: string | undefined;
+    if (cryptoKey) {
+      const ivBytes = crypto.getRandomValues(new Uint8Array(12));
+      const ciphertext = await crypto.subtle.encrypt({ name: 'AES-GCM', iv: ivBytes }, cryptoKey, encoder.encode(plaintext));
+      stored = bytesToBase64(new Uint8Array(ciphertext));
+      iv = bytesToBase64(ivBytes);
+    }
+    const bytes = encoder.encode(stored).byteLength;
     if (bytes > maxChunkBytes) throw new Error(`Backup chunk too large: ${table}`);
-    const key = `${base}${table}/${String(chunkIndex).padStart(10, '0')}.json`;
-    await store.put(key, data);
-    manifest.chunks.push({ key, table, rows: rows.length, bytes, sha256: await sha256(data) });
+    const chunkKey = `${base}${table}/${String(chunkIndex).padStart(10, '0')}.json`;
+    await store.put(chunkKey, stored);
+    manifest.chunks.push({ key: chunkKey, table, rows: rows.length, bytes, sha256: checksum, ...(iv ? { iv } : {}) });
     manifest.rowCounts[table] += rows.length;
     totalBytes += bytes;
   };
@@ -120,14 +167,24 @@ export async function createLogicalBackup(db: SeltivoDb, store: Store, at = new 
   return { key, manifest, bytes: totalBytes };
 }
 
-export async function restoreLogicalBackup(db: SeltivoDb, store: Store, manifestKey: string, deletedIds: Iterable<string> = []): Promise<BackupManifest> {
+export async function restoreLogicalBackup(db: SeltivoDb, store: Store, manifestKey: string, deletedIds: Iterable<string> = [], encryptionKey?: string): Promise<BackupManifest> {
   if (!manifestKeyPattern.test(manifestKey)) throw new Error('Invalid backup manifest key');
   assertSchema(db);
   const object = await store.get(manifestKey);
   if (!object) throw new Error('Backup manifest missing');
   const manifest = JSON.parse(await object.text()) as BackupManifest;
-  if (manifest.format !== 'seltivo-logical-v1' || manifest.schemaVersion !== latestVersion || !Array.isArray(manifest.chunks)) {
+  if (manifest.format !== 'seltivo-logical-v1' || !Number.isInteger(manifest.schemaVersion) || manifest.schemaVersion < 1 || !Array.isArray(manifest.chunks)) {
     throw new Error('Incompatible backup manifest');
+  }
+  // Older backups omit columns added by later migrations; a subset INSERT is valid.
+  // Semantic migrations have no DDL to replay, so v9's de-verification is applied
+  // explicitly after rows and confirmed deletions are imported (see below).
+  if (manifest.schemaVersion > latestVersion) throw new Error(`Backup schema version ${manifest.schemaVersion} is newer than this application (${latestVersion})`);
+  if (manifest.encryption !== undefined && manifest.encryption !== encryptionMarker) throw new Error(`Unsupported backup encryption marker: ${String(manifest.encryption)}`);
+  let cryptoKey: CryptoKey | null = null;
+  if (manifest.encryption === encryptionMarker) {
+    if (!encryptionKey) throw new Error('Backup is encrypted but no encryption key was provided');
+    cryptoKey = await aesGcmKey(encryptionKeyBytes(encryptionKey));
   }
   const base = manifestKey.slice(0, -'manifest.json'.length);
   const escapedBase = base.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
@@ -142,8 +199,19 @@ export async function restoreLogicalBackup(db: SeltivoDb, store: Store, manifest
     if (!tables.includes(chunk.table) || !chunkPattern.test(chunk.key)) throw new Error('Invalid backup chunk key');
     const part = await store.get(chunk.key);
     if (!part) throw new Error('Backup chunk missing');
-    const data = await part.text();
-    if (encoder.encode(data).byteLength !== chunk.bytes || await sha256(data) !== chunk.sha256) throw new Error('Backup chunk checksum mismatch');
+    const stored = await part.text();
+    if (encoder.encode(stored).byteLength !== chunk.bytes) throw new Error('Backup chunk checksum mismatch');
+    let data = stored;
+    if (cryptoKey) {
+      if (!chunk.iv) throw new Error('Backup chunk missing encryption IV');
+      try {
+        const plaintext = await crypto.subtle.decrypt({ name: 'AES-GCM', iv: base64ToBytes(chunk.iv) }, cryptoKey, base64ToBytes(stored));
+        data = new TextDecoder().decode(plaintext);
+      } catch {
+        throw new Error('Backup chunk decryption failed');
+      }
+    }
+    if (await sha256(data) !== chunk.sha256) throw new Error('Backup chunk checksum mismatch');
     const rows = JSON.parse(data) as Row[];
     if (!Array.isArray(rows) || rows.length !== chunk.rows) throw new Error('Backup chunk row count mismatch');
     const allowed = new Set((db.prepare(`PRAGMA table_info(${chunk.table})`).all() as { name: string }[]).map((column) => column.name));
@@ -162,6 +230,16 @@ export async function restoreLogicalBackup(db: SeltivoDb, store: Store, manifest
     if (actualCounts[table] !== manifest.rowCounts?.[table]) throw new Error('Backup table row count mismatch');
   }
   for (const id of deletedIds) purgeCustomer(db, id);
+  // v9 was a data-only migration: backups taken before it still carry verified
+  // customers and their live sessions. Replay its effect so an old backup cannot
+  // restore verification or sessions that migration v9 intentionally revoked.
+  // Admin accounts are unaffected, exactly as in MIGRATIONS v9.
+  if (manifest.schemaVersion < 9) {
+    db.transaction(() => {
+      db.prepare("UPDATE users SET email_verified_at=NULL WHERE role='customer'").run();
+      db.prepare("DELETE FROM sessions WHERE user_id IN (SELECT id FROM users WHERE role='customer')").run();
+    })();
+  }
   if ((db.pragma('foreign_key_check') as unknown[]).length) throw new Error('Foreign key violation after backup restore');
   return manifest;
 }

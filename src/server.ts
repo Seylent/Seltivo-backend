@@ -3,6 +3,8 @@ import { openDatabase } from './db.js';
 import { buildApp } from './app.js';
 import { purgeCustomer } from './delete-account.js';
 import { recordLocalDeletion, replayLocalDeletions } from './local-deletion-ledger.js';
+import { redactDevMail } from './dev-mail.js';
+import { deriveServerSecurity } from './server-config.js';
 
 const origin = process.env.SELTIVO_PUBLIC_ORIGIN;
 if (!origin) throw new Error('SELTIVO_PUBLIC_ORIGIN is required');
@@ -18,7 +20,7 @@ const smtp = process.env.SMTP_HOST && process.env.SMTP_USER && process.env.SMTP_
       socketTimeout: 15_000,
       auth: { user: process.env.SMTP_USER, pass: process.env.SMTP_PASSWORD },
     }) : null;
-const devMail = process.env.NODE_ENV !== 'production' && process.env.SELTIVO_DEV_MAIL === 'console';
+const { secureCookies, devMail } = deriveServerSecurity(origin, process.env);
 const selfServiceDeletionEnabled = process.env.SELTIVO_ACCOUNT_DELETION_ENABLED === '1';
 // Після restore старої БД видалені акаунти мають зникнути знову — це стосується
 // і видалень, зроблених адміністратором, навіть коли самообслуговування вимкнено.
@@ -34,7 +36,7 @@ const deleteCustomer = async (userId: string) => {
 const app = buildApp({
   db,
   origin,
-  secureCookies: process.env.NODE_ENV === 'production',
+  secureCookies,
   requireAdmin2FA: process.env.SELTIVO_REQUIRE_ADMIN_2FA === '1',
   teamEmail: process.env.SELTIVO_TEAM_EMAIL,
   databaseBytes: () => (db.pragma('page_count', { simple: true }) as number) * (db.pragma('page_size', { simple: true }) as number),
@@ -42,11 +44,8 @@ const app = buildApp({
   selfServiceDeletionEnabled,
   sendMail: smtp ? async (to, subject, text, html) => { await smtp.sendMail({ from: process.env.SMTP_FROM, to, subject, text, ...(html ? { html } : {}) }); }
     : devMail ? async (to, subject, text) => {
-      // Dev-консоль часто потрапляє в логи — токени з посилань друкувати не можна.
-      const redact = (value: string) => value
-        .replace(/([?&](?:token|code)=)[^\s&]+/gi, '$1***')
-        .replace(/(SELTIVO:\s*)\d{6}\b/gi, '$1******');
-      console.log(`DEV MAIL to ${to}: ${redact(subject)}\n${redact(text)}`);
+      // Dev-консоль часто потрапляє в логи — коди й токени друкувати не можна.
+      console.log(`DEV MAIL to ${to}: ${redactDevMail(subject)}\n${redactDevMail(text)}`);
     } : undefined,
 });
 const port = Number(process.env.PORT ?? 4000);

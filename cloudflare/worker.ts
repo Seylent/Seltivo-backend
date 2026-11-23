@@ -11,6 +11,51 @@ import { hashPassword, isValidPasswordHash, normalizeEmail, now } from '../src/a
 import type { SeltivoDb } from '../src/db.js';
 export { DeletionLedger } from './deletion-ledger.js';
 
+const LEDGER_TIMEOUT_MS = 5_000;
+const LEDGER_RETRY_DELAY_MS = 50;
+const MIN_REPLAY_DELAY_MS = 60_000;
+const MAX_REPLAY_DELAY_MS = 60 * 60 * 1000;
+const PENDING_REPLAY_KEY = 'deletion-replay:pending';
+
+// Bounded exponential backoff: 1m → 2m → 4m → 8m → 16m → 32m → 60m (max).
+// Never returns zero, so a persistently failing replay cannot spin in a tight loop.
+export function replayRetryDelayMs(attempt: number): number {
+  const step = Number.isFinite(attempt) ? Math.max(1, Math.floor(attempt)) : 1;
+  return Math.min(MAX_REPLAY_DELAY_MS, MIN_REPLAY_DELAY_MS * 2 ** (step - 1));
+}
+
+// Structured logs must not carry customer identifiers or email addresses.
+export function errorDetails(error: unknown): { errorType: string; message: string } {
+  const raw = error instanceof Error ? error.message : 'unknown';
+  return {
+    errorType: error instanceof Error ? error.name : 'unknown',
+    message: raw
+      .replace(/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/gi, '[id]')
+      .replace(/[^\s@]+@[^\s@]+\.[^\s@]+/g, '[email]')
+      .slice(0, 300),
+  };
+}
+
+// Every DO→DO ledger call is bounded. The constructor and deletion paths get
+// one retry; non-ok responses and thrown errors both fail closed after that.
+async function ledgerFetch(ledger: DurableObjectStub, init: RequestInit = {}, retries = 1): Promise<Response> {
+  let lastError: unknown;
+  for (let attempt = 0; attempt <= retries; attempt += 1) {
+    try {
+      const response = await ledger.fetch('https://ledger.internal/deletions', {
+        ...init,
+        signal: AbortSignal.timeout(LEDGER_TIMEOUT_MS),
+      });
+      if (response.ok) return response;
+      lastError = new Error(`Deletion ledger unavailable (status ${response.status})`);
+    } catch (error) {
+      lastError = error;
+    }
+    if (attempt < retries) await new Promise((resolve) => setTimeout(resolve, LEDGER_RETRY_DELAY_MS));
+  }
+  throw lastError;
+}
+
 interface Env {
   SELTIVO: DurableObjectNamespace;
   SELTIVO_DELETIONS: DurableObjectNamespace;
@@ -21,12 +66,15 @@ interface Env {
   BREVO_API_KEY?: string;
   BREVO_SENDER_EMAIL?: string;
   SELTIVO_ACCOUNT_DELETION_ENABLED?: string;
+  SELTIVO_STAGING?: string;
   SELTIVO_STAGING_TEST_KEY?: string;
   SELTIVO_REQUIRE_EMAIL_VERIFICATION?: string;
   SELTIVO_REQUIRE_ADMIN_2FA?: string;
+  SELTIVO_BACKUP_ENCRYPTION_KEY?: string;
 }
 
-function stagingControlsEnabled(env: Env): boolean {
+export function stagingControlsEnabled(env: Env): boolean {
+  if (env.SELTIVO_STAGING !== '1') return false;
   const local = /^http:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/.test(env.SELTIVO_PUBLIC_ORIGIN);
   return Boolean(env.SELTIVO_STAGING_TEST_KEY)
     && (env.SELTIVO_PUBLIC_ORIGIN === 'https://seltivo-staging.seltivostudio.workers.dev' || local);
@@ -70,10 +118,18 @@ export class SeltivoData extends DurableObject<Env> {
     this.ledger = ledger;
     this.restoreProbe = stagingControlsEnabled(env) && ctx.id.name?.startsWith('restore-check-') === true;
     ctx.blockConcurrencyWhile(async () => {
-      const response = await ledger.fetch('https://ledger.internal/deletions');
-      if (!response.ok) throw new Error('Deletion ledger unavailable');
-      const { ids } = await response.json() as { ids: string[] };
-      for (const id of ids) purgeCustomer(db, id);
+      const pending = await ctx.storage.get<{ attempts?: number }>(PENDING_REPLAY_KEY);
+      if (await this.replayDeletions()) {
+        // Clear a leftover retry marker so a resolved replay cannot keep firing alarms.
+        if (pending) {
+          await ctx.storage.delete(PENDING_REPLAY_KEY);
+          await ctx.storage.deleteAlarm();
+        }
+        return;
+      }
+      const attempts = typeof pending?.attempts === 'number' ? pending.attempts : 1;
+      await ctx.storage.put(PENDING_REPLAY_KEY, { attempts });
+      await ctx.storage.setAlarm(Date.now() + replayRetryDelayMs(attempts));
     });
     if (env.SELTIVO_ADMIN_PASSWORD_HASH && !this.restoreProbe) {
       if (!isValidPasswordHash(env.SELTIVO_ADMIN_PASSWORD_HASH)) {
@@ -95,10 +151,11 @@ export class SeltivoData extends DurableObject<Env> {
     // незалежно від прапорця самообслуговування DELETE /me.
     const deleteCustomer = async (userId: string) => {
       try {
-        const response = await ledger.fetch(new Request('https://ledger.internal/deletions', {
-          method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ id: userId }),
-        }));
-        if (!response.ok) throw new Error('Deletion ledger unavailable');
+        await ledgerFetch(ledger, {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ id: userId }),
+        });
         purgeCustomer(db, userId);
       } catch (error) {
         ctx.abort();
@@ -119,6 +176,23 @@ export class SeltivoData extends DurableObject<Env> {
       deleteCustomer,
       selfServiceDeletionEnabled: env.SELTIVO_ACCOUNT_DELETION_ENABLED === '1',
     });
+  }
+
+  // Replay is per-id: one poisoned ledger row must not prevent the primary DO
+  // from starting. A ledger read failure still throws (fail closed).
+  private async replayDeletions(): Promise<boolean> {
+    const response = await ledgerFetch(this.ledger);
+    const { ids } = await response.json() as { ids: string[] };
+    let failed = 0;
+    for (const id of ids) {
+      try {
+        purgeCustomer(this.db, id);
+      } catch (error) {
+        failed += 1;
+        console.error(JSON.stringify({ event: 'deletion_replay_failed', ...errorDetails(error) }));
+      }
+    }
+    return failed === 0;
   }
 
   // Грубий per-DO ліміт записів, який спрацьовує ДО читання тіла.
@@ -154,15 +228,18 @@ export class SeltivoData extends DurableObject<Env> {
       await this.ctx.storage.setAlarm(Date.now() + 60 * 60 * 1000);
       const body = await request.json().catch(() => null) as { manifestKey?: unknown } | null;
       if (typeof body?.manifestKey !== 'string') return new Response(null, { status: 422 });
-      const ledgerResponse = await this.ledger.fetch('https://ledger.internal/deletions');
+      const ledgerResponse = await this.ledger.fetch('https://ledger.internal/deletions', {
+        signal: AbortSignal.timeout(LEDGER_TIMEOUT_MS),
+      });
       if (!ledgerResponse.ok) return new Response(null, { status: 503 });
       const { ids } = await ledgerResponse.json() as { ids: string[] };
       try {
-        const manifest = await restoreLogicalBackup(this.db, this.backupBucket, body.manifestKey, ids);
+        const manifest = await restoreLogicalBackup(this.db, this.backupBucket, body.manifestKey, ids, this.env.SELTIVO_BACKUP_ENCRYPTION_KEY);
         const quickCheck = this.db.pragma('quick_check') as string;
         if (quickCheck !== 'ok') throw new Error('Staging quick_check failed');
         return Response.json({ rows: Object.values(manifest.rowCounts).reduce((sum, count) => sum + count, 0), quickCheck });
-      } catch {
+      } catch (error) {
+        console.error(JSON.stringify({ event: 'staging_restore_failed', requestId, ...errorDetails(error) }));
         return new Response(null, { status: 500 });
       }
     }
@@ -181,8 +258,14 @@ export class SeltivoData extends DurableObject<Env> {
       return new Response(null, { status: 201 });
     }
     if (url.pathname === '/internal/backup' && request.method === 'POST') {
+      // Backups contain password hashes and admin TOTP secrets — never write them
+      // to R2 in plaintext. Legacy plaintext backups remain readable on restore.
+      if (!this.env.SELTIVO_BACKUP_ENCRYPTION_KEY) {
+        console.error(JSON.stringify({ event: 'backup_encryption_key_missing', requestId }));
+        return Response.json({ error: 'Backup encryption key is not configured' }, { status: 500 });
+      }
       try {
-        const result = await createLogicalBackup(this.db, this.backupBucket);
+        const result = await createLogicalBackup(this.db, this.backupBucket, undefined, this.env.SELTIVO_BACKUP_ENCRYPTION_KEY);
         console.log(JSON.stringify({ event: 'backup_completed', requestId, durationMs: Date.now() - started,
           bytes: result.bytes, databaseBytes: this.ctx.storage.sql.databaseSize }));
         return Response.json({ key: result.key, bytes: result.bytes });
@@ -250,7 +333,33 @@ export class SeltivoData extends DurableObject<Env> {
   }
 
   async alarm(): Promise<void> {
-    if (this.restoreProbe) await this.ctx.storage.deleteAll();
+    if (this.restoreProbe) {
+      await this.ctx.storage.deleteAll();
+      return;
+    }
+    const pending = await this.ctx.storage.get<{ attempts?: number }>(PENDING_REPLAY_KEY);
+    if (!pending) {
+      await this.ctx.storage.deleteAlarm();
+      return;
+    }
+    const attempts = (typeof pending.attempts === 'number' ? pending.attempts : 0) + 1;
+    let allPurged = false;
+    try {
+      allPurged = await this.replayDeletions();
+    } catch (error) {
+      console.error(JSON.stringify({ event: 'deletion_replay_ledger_failed', attempts, ...errorDetails(error) }));
+    }
+    if (allPurged) {
+      await this.ctx.storage.delete(PENDING_REPLAY_KEY);
+      await this.ctx.storage.deleteAlarm();
+      return;
+    }
+    // A still-unpurged id is never abandoned: its data would stay accessible
+    // after a PITR restore. Keep the marker and retry with bounded backoff.
+    const nextDelayMs = replayRetryDelayMs(attempts);
+    console.error(JSON.stringify({ event: 'deletion_replay_retry', attempts, nextDelayMs }));
+    await this.ctx.storage.put(PENDING_REPLAY_KEY, { attempts });
+    await this.ctx.storage.setAlarm(Date.now() + nextDelayMs);
   }
 }
 
@@ -277,7 +386,7 @@ export default {
           const result = await runStagingRestoreCheck(env, await request.json());
           return Response.json(result);
         } catch (error) {
-          console.error(JSON.stringify({ event: 'staging_restore_check_failed', reason: error instanceof Error ? error.message : 'unknown' }));
+          console.error(JSON.stringify({ event: 'staging_restore_check_failed', ...errorDetails(error) }));
           return Response.json({ error: 'Staging restore check failed' }, { status: 500 });
         }
       }

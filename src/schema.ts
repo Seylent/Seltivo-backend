@@ -74,7 +74,7 @@ export const SCHEMA_SQL = `
 export const MIGRATIONS = [
   { version: 1, sql: SCHEMA_SQL },
   { version: 2, sql: `
-    CREATE TABLE email_notifications (
+    CREATE TABLE IF NOT EXISTS email_notifications (
       id TEXT PRIMARY KEY,
       message_id INTEGER NOT NULL UNIQUE REFERENCES messages(id) ON DELETE CASCADE,
       recipient TEXT NOT NULL,
@@ -85,10 +85,10 @@ export const MIGRATIONS = [
       last_error_code TEXT,
       created_at TEXT NOT NULL
     );
-    CREATE INDEX email_notifications_status ON email_notifications(status, created_at DESC);
+    CREATE INDEX IF NOT EXISTS email_notifications_status ON email_notifications(status, created_at DESC);
   ` },
   { version: 3, sql: `
-    CREATE TABLE notifications (
+    CREATE TABLE IF NOT EXISTS notifications (
       id TEXT PRIMARY KEY,
       recipient_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
       request_id TEXT NOT NULL REFERENCES requests(id) ON DELETE CASCADE,
@@ -97,8 +97,8 @@ export const MIGRATIONS = [
       created_at TEXT NOT NULL,
       read_at TEXT
     );
-    CREATE INDEX notifications_recipient ON notifications(recipient_id, created_at DESC);
-    CREATE INDEX notifications_request ON notifications(request_id, recipient_id, read_at);
+    CREATE INDEX IF NOT EXISTS notifications_recipient ON notifications(recipient_id, created_at DESC);
+    CREATE INDEX IF NOT EXISTS notifications_request ON notifications(request_id, recipient_id, read_at);
   ` },
   { version: 4, sql: `
     CREATE INDEX IF NOT EXISTS users_role_created ON users(role, created_at DESC, id DESC);
@@ -108,7 +108,7 @@ export const MIGRATIONS = [
     CREATE INDEX IF NOT EXISTS audit_entity ON audit_log(entity_type, entity_id);
   ` },
   { version: 5, sql: `
-    CREATE TABLE admin_two_factor (
+    CREATE TABLE IF NOT EXISTS admin_two_factor (
       user_id TEXT PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
       secret TEXT NOT NULL,
       enabled_at TEXT,
@@ -116,7 +116,7 @@ export const MIGRATIONS = [
     );
   ` },
   { version: 6, sql: `
-    CREATE TABLE guest_requests (
+    CREATE TABLE IF NOT EXISTS guest_requests (
       id TEXT PRIMARY KEY,
       name TEXT NOT NULL,
       contact TEXT NOT NULL,
@@ -129,7 +129,7 @@ export const MIGRATIONS = [
       created_at TEXT NOT NULL,
       processed_at TEXT
     );
-    CREATE INDEX guest_requests_created ON guest_requests(created_at DESC, id DESC);
+    CREATE INDEX IF NOT EXISTS guest_requests_created ON guest_requests(created_at DESC, id DESC);
   ` },
   { version: 7, sql: `
     ALTER TABLE guest_requests ADD COLUMN trial_json TEXT;

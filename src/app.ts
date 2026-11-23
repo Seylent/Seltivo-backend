@@ -1,4 +1,4 @@
-import { randomUUID } from 'node:crypto';
+import { randomUUID, timingSafeEqual } from 'node:crypto';
 import Fastify, { type FastifyInstance, type FastifyReply, type FastifyRequest } from 'fastify';
 import { z } from 'zod';
 import type { SeltivoDb } from './db.js';
@@ -41,6 +41,13 @@ const transitions: Record<Status, Status[]> = {
 };
 const fail = (reply: FastifyReply, status: number, error: string) => reply.code(status).send({ error });
 
+/** Порівняння sha256-хешів без витоку довжини збігу через час відповіді. */
+export function tokenHashesEqual(supplied: string, expected: string): boolean {
+  const left = Buffer.from(supplied, 'hex');
+  const right = Buffer.from(expected, 'hex');
+  return left.length === 32 && right.length === 32 && timingSafeEqual(left, right);
+}
+
 type Mail = (to: string, subject: string, text: string, html?: string) => Promise<void>;
 export type AppOptions = { db: SeltivoDb; origin: string; secureCookies?: boolean; requireEmailVerification?: boolean; requireAdmin2FA?: boolean; sendMail?: Mail; teamEmail?: string; databaseBytes?: () => number; deleteCustomer?: (userId: string) => Promise<void>; selfServiceDeletionEnabled?: boolean; logger?: boolean; router?: FastifyInstance; dataLimits?: Partial<DataLimits> };
 const MAX_CONFIGURATIONS_PER_USER = 50;
@@ -63,10 +70,14 @@ function localeFromRequest(request: FastifyRequest): Locale | null {
 }
 /** Пише автовідповідь від першого активного менеджера. Фіксований ключ на заявку дає рівно одне повідомлення. */
 function insertChatAutoReply(db: SeltivoDb, conversationId: string, requestId: string, locale: Locale | null, timestamp: string): boolean {
+  const key = `${AUTOREPLY_KEY_PREFIX}${requestId}`;
+  // Ключ унікальний лише для (sender_id, client_message_id), тож сам INSERT OR IGNORE
+  // не захищає від другого привітання, коли перший менеджер став неактивним.
+  if (db.prepare('SELECT id FROM messages WHERE conversation_id=? AND client_message_id=?').get(conversationId, key)) return false;
   const sender = db.prepare("SELECT id FROM users WHERE role='admin' AND disabled_at IS NULL ORDER BY created_at ASC LIMIT 1").get() as { id: string } | undefined;
   if (!sender) return false;
   return db.prepare('INSERT OR IGNORE INTO messages(conversation_id,sender_id,client_message_id,body,created_at) VALUES (?,?,?,?,?)')
-    .run(conversationId, sender.id, `${AUTOREPLY_KEY_PREFIX}${requestId}`, CHAT_AUTOREPLY[locale ?? 'uk'], timestamp).changes > 0;
+    .run(conversationId, sender.id, key, CHAT_AUTOREPLY[locale ?? 'uk'], timestamp).changes > 0;
 }
 const RETENTION_MS = 30 * 24 * 60 * 60 * 1000;
 const PNG_SIGNATURE = Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]);
@@ -128,44 +139,77 @@ export function buildApp({ db, origin, secureCookies = false, requireEmailVerifi
     return addedBytes <= 0 || storageAvailable(reply);
   };
   const chatEvents = createChatEvents();
-  const attempts = new Map<string, number[]>();
-  const pruneAttempts = (current: number) => {
-    if (attempts.size <= 10_000) return;
-    const staleBefore = current - 15 * 60_000;
-    for (const [entry, times] of attempts) {
-      if (attempts.size <= 9_000) break;
-      if (!times.some((time) => time > staleBefore)) attempts.delete(entry);
+  /** Each entry keeps the window it was recorded with, so staleness pruning uses
+   * that key's own window (e.g. 1 hour for exports) instead of a fixed 15 minutes. */
+  type RateEntry = { times: number[]; windowMs: number };
+  const RATE_LIMIT_MAX_KEYS = 10_000;
+  const RATE_LIMIT_TRIM_TO = 9_000;
+  // Two separate key spaces: IP/global keys are attacker-controlled and safe to
+  // evict; email/export keys are security locks whose lockouts/quotas must survive.
+  const attempts = new Map<string, RateEntry>();
+  const sensitiveAttempts = new Map<string, RateEntry>();
+  const isSensitiveKey = (key: string) => key.startsWith('email:') || key.startsWith('export:');
+  const storeFor = (key: string) => isSensitiveKey(key) ? sensitiveAttempts : attempts;
+  /** Reclaims capacity in the IP/global map. Never rejects: every key there is
+   * safe to evict, so prune expired entries then drop the oldest until there is room. */
+  const makeRoomInGlobal = (current: number) => {
+    if (attempts.size < RATE_LIMIT_MAX_KEYS) return;
+    for (const [key, entry] of attempts) {
+      if (attempts.size <= RATE_LIMIT_TRIM_TO) break;
+      if (!entry.times.some((time) => current - time < entry.windowMs)) attempts.delete(key);
     }
-    for (const entry of attempts.keys()) {
-      if (attempts.size <= 9_000) break;
-      attempts.delete(entry);
+    for (const key of attempts.keys()) {
+      if (attempts.size < RATE_LIMIT_MAX_KEYS) break;
+      attempts.delete(key);
     }
+  };
+  /** Reclaims capacity in the sensitive map by dropping only expired locks.
+   * Returns false when every key is still live — the caller then allows the new
+   * key without recording it, so capacity can never produce a 429. */
+  const makeRoomInSensitive = (current: number): boolean => {
+    if (sensitiveAttempts.size < RATE_LIMIT_MAX_KEYS) return true;
+    for (const [key, entry] of sensitiveAttempts) {
+      if (!entry.times.some((time) => current - time < entry.windowMs)) sensitiveAttempts.delete(key);
+    }
+    return sensitiveAttempts.size < RATE_LIMIT_MAX_KEYS;
   };
   const checkRateLimit = (key: string, windowMs: number, max: number, reply: FastifyReply, record = true): boolean => {
     const current = Date.now();
-    const recent = (attempts.get(key) ?? []).filter((time) => current - time < windowMs);
+    const store = storeFor(key);
+    const entry = store.get(key);
+    const recent = (entry?.times ?? []).filter((time) => current - time < windowMs);
     if (recent.length >= max) {
       reply.header('Retry-After', String(Math.max(1, Math.ceil((windowMs - (current - recent[0])) / 1000))));
       fail(reply, 429, 'Забагато запитів. Спробуйте пізніше.');
       return false;
     }
-    if (record) {
-      recent.push(current);
-      attempts.set(key, recent);
-      pruneAttempts(current);
-    } else if (recent.length) {
-      attempts.set(key, recent);
-    } else {
-      attempts.delete(key);
+    if (!entry) {
+      if (store === sensitiveAttempts) {
+        // A brand-new sensitive key must not evict a live lockout/quota. When the
+        // map is full, allow the request but do not start tracking this key.
+        if (!makeRoomInSensitive(current)) return true;
+      } else {
+        makeRoomInGlobal(current);
+      }
     }
+    if (record) store.set(key, { times: [...recent, current], windowMs });
+    else if (recent.length) store.set(key, { times: recent, windowMs });
+    else store.delete(key);
     return true;
   };
   const recordAttempt = (key: string, windowMs: number) => {
     const current = Date.now();
-    const recent = (attempts.get(key) ?? []).filter((time) => current - time < windowMs);
-    recent.push(current);
-    attempts.set(key, recent);
-    pruneAttempts(current);
+    const store = storeFor(key);
+    const entry = store.get(key);
+    const recent = (entry?.times ?? []).filter((time) => current - time < windowMs);
+    if (!entry) {
+      if (store === sensitiveAttempts) {
+        if (!makeRoomInSensitive(current)) return;
+      } else {
+        makeRoomInGlobal(current);
+      }
+    }
+    store.set(key, { times: [...recent, current], windowMs });
   };
   const rateLimitBucket = (method: string, rawPath: string): { bucket: string; windowMs: number; max: number } | null => {
     const path = rawPath.length > 1 ? rawPath.replace(/\/+$/, '') : rawPath;
@@ -364,11 +408,13 @@ export function buildApp({ db, origin, secureCookies = false, requireEmailVerifi
       if (token && token.attempts >= 5) return fail(reply, 429, 'Забагато спроб. Запросіть новий код.');
       if (token) {
         const supplied = hashToken(`${user!.id}:${body.code}`);
-        if (supplied === token.token_hash) row = { user_id: user!.id, token_hash: token.token_hash };
+        if (tokenHashesEqual(supplied, token.token_hash)) row = { user_id: user!.id, token_hash: token.token_hash };
         else db.prepare('UPDATE auth_tokens SET attempts=attempts+1 WHERE token_hash=?').run(token.token_hash);
       }
     } else {
-      row = db.prepare("SELECT user_id,token_hash FROM auth_tokens WHERE token_hash=? AND purpose='verify' AND expires_at>?").get(hashToken(body.token), now()) as typeof row;
+      row = db.prepare(`SELECT t.user_id,t.token_hash FROM auth_tokens t JOIN users u ON u.id=t.user_id
+        WHERE t.token_hash=? AND t.purpose='verify' AND t.expires_at>? AND u.role='customer' AND u.disabled_at IS NULL`)
+        .get(hashToken(body.token), now()) as typeof row;
     }
     if (!row) return fail(reply, 422, 'Код недійсний або прострочений.');
     db.transaction(() => {
@@ -402,7 +448,9 @@ export function buildApp({ db, origin, secureCookies = false, requireEmailVerifi
         AND budget=? AND note=? AND template_name IS ? AND trial_json IS ?`)
         .get(body.id, body.name, body.contact, features, body.budget, body.note, body.templateName ?? null, trial);
       if (!same) return fail(reply, 409, 'Ключ повтору вже використано.');
-      if (body.telegramStatus === 'sent') db.prepare("UPDATE guest_requests SET telegram_status='sent' WHERE id=?").run(body.id);
+      // Повтор із відомим id може лише закрити невдалу доставку; уже 'sent' не перезаписуємо.
+      // Решта полів не змінюється — вони вже звірені запитом same вище.
+      if (body.telegramStatus === 'sent') db.prepare("UPDATE guest_requests SET telegram_status='sent' WHERE id=? AND telegram_status='failed'").run(body.id);
     }
     if (stored.changes) chatEvents.publish('', { kind: 'request', requestId: body.id });
     return reply.code(stored.changes ? 201 : 200).send({ id: body.id });
@@ -447,7 +495,7 @@ export function buildApp({ db, origin, secureCookies = false, requireEmailVerifi
         return reply.code(403).send({ error: 'Для адміністратора потрібно увімкнути двофакторну авторизацію.', twoFactorEnrollmentRequired: true });
       }
     }
-    attempts.delete(emailLimitKey);
+    storeFor(emailLimitKey).delete(emailLimitKey);
     const token = db.transaction(() => {
       const previous = sessionTokenFromRequest(request);
       if (previous) db.prepare('DELETE FROM sessions WHERE token_hash=?').run(hashToken(previous));
@@ -644,7 +692,7 @@ export function buildApp({ db, origin, secureCookies = false, requireEmailVerifi
     if (!Number.isInteger(revision) || revision < 1) return fail(reply, 400, 'Потрібна версія If-Match.');
     const configId = (request.params as { id: string }).id;
     const existing = db.prepare('SELECT template_id,length(CAST(data_json AS BLOB)) bytes FROM configurations WHERE id=? AND owner_id=? AND deleted_at IS NULL').get(configId, actor.id) as { template_id: string; bytes: number } | undefined;
-    if (!existing) return fail(reply, 409, 'Конфігурацію змінено або не знайдено.');
+    if (!existing) return fail(reply, 404, 'Не знайдено.');
     const json = configJson(body.data, existing.template_id); if (!json) return fail(reply, 422, 'Конфігурація завелика або пошкоджена.');
     if (!accountAvailable(actor.id, Buffer.byteLength(json) - existing.bytes, reply)) return;
     const result = db.prepare('UPDATE configurations SET name=?,data_json=?,revision=revision+1,updated_at=? WHERE id=? AND owner_id=? AND revision=? AND deleted_at IS NULL')

@@ -1,6 +1,6 @@
 import type { FastifyInstance } from 'fastify';
 
-type Handler = (request: any, reply: Reply) => unknown | Promise<unknown>;
+type Handler = (request: any, reply: Reply, payload?: unknown) => unknown | Promise<unknown>;
 type ErrorHandler = (error: unknown, request: any, reply: Reply) => unknown | Promise<unknown>;
 type Route = { method: string; pattern: RegExp; names: string[]; handler: Handler };
 
@@ -77,7 +77,10 @@ export function createWorkerRouter(): FastifyInstance {
           else throw error;
         }
       }
-      for (const hook of hooks.onSend) await hook({ method: input.method, url: input.url, headers: {} }, reply);
+      for (const hook of hooks.onSend) {
+        const transformed = await hook({ method: input.method, url: input.url, headers: {} }, reply, reply.payload);
+        if (transformed !== undefined && reply.sent) reply.payload = transformed;
+      }
       if (reply.payload instanceof ReadableStream) {
         return { statusCode: reply.statusCode, headers: reply.headers, rawPayload: Buffer.alloc(0), stream: reply.payload };
       }

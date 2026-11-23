@@ -35,7 +35,16 @@ const escapeHtml = (value: string): string => value.replace(/[&<>"']/g, (char) =
   '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;',
 }[char] ?? char));
 
-const safeUrl = (value: string): string => escapeHtml(value.replace(/["'\s]/g, ''));
+/** Лише http(s) посилання можна рендерити; усе інше замінюємо на безпечний origin. */
+const normalizedUrl = (value: string): string => {
+  const cleaned = value.replace(/["'\s]/g, '');
+  try {
+    const protocol = new URL(cleaned).protocol;
+    if (protocol === 'http:' || protocol === 'https:') return cleaned;
+  } catch { /* невалідне посилання — підміняємо безпечним */ }
+  return ASSET_ORIGIN;
+};
+const safeUrl = (value: string): string => escapeHtml(normalizedUrl(value));
 
 const formatCode = (code: string): string => escapeHtml(code).replace(/(\d{3})(?=\d)/g, '$1&nbsp;');
 
@@ -241,7 +250,7 @@ export function renderEmail(kind: EmailKind, params: EmailParams = {}, locale?: 
         subtitle: lang === 'uk' ? 'Менеджер студії відповів у вашій заявці' : 'A studio manager replied to your request',
       }
     : COPY[kind][lang];
-  const origin = (params.origin || ASSET_ORIGIN).replace(/\/$/, '');
+  const origin = normalizedUrl((params.origin || ASSET_ORIGIN).replace(/\/+$/, ''));
   const code = (params.code ?? '').replace(/\D/g, '').slice(0, 6);
 
   if (kind === 'verification') {
@@ -251,7 +260,7 @@ export function renderEmail(kind: EmailKind, params: EmailParams = {}, locale?: 
     return { subject: copy.subject, text, html: layout(lang, copy, verificationContent(code, copy, origin), origin) };
   }
 
-  const url = params.url || `${origin}/`;
+  const url = normalizedUrl(params.url || `${origin}/`);
   if (kind === 'reset-password') {
     // Посилання останнім рядком: клієнтські тести й логи дістають його split(': ').pop().
     const text = lang === 'uk'

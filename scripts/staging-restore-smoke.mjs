@@ -4,8 +4,18 @@ import { readFileSync } from 'node:fs';
 
 const origin = process.env.SELTIVO_STAGING_ORIGIN ?? 'https://seltivo-staging.seltivostudio.workers.dev';
 const backend = process.env.SELTIVO_STAGING_API ?? 'https://seltivo-api-staging.seltivostudio.workers.dev';
-const key = process.env.SELTIVO_STAGING_TEST_KEY ?? readFileSync('.wrangler/codex-staging-key.txt', 'utf8').trim();
-if (!key) throw new Error('SELTIVO_STAGING_TEST_KEY is required');
+function readStagingKey() {
+  if (process.env.SELTIVO_STAGING_TEST_KEY) return process.env.SELTIVO_STAGING_TEST_KEY.trim();
+  try {
+    return readFileSync('.wrangler/codex-staging-key.txt', 'utf8').trim();
+  } catch {
+    return '';
+  }
+}
+const key = readStagingKey();
+if (!key) {
+  throw new Error('SELTIVO_STAGING_TEST_KEY is required: temporarily set the staging-only secret with `npx wrangler secret put SELTIVO_STAGING_TEST_KEY --env staging` (or put the key in .wrangler/codex-staging-key.txt), run the drill, then remove it with `npx wrangler secret delete SELTIVO_STAGING_TEST_KEY --env staging`. See docs/cloudflare-operations.md for the drill procedure; never use a production key.');
+}
 
 async function api(method, path, body, cookie) {
   const response = await fetch(`${origin}${path}`, { method, headers: {

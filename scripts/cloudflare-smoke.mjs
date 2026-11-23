@@ -2,8 +2,17 @@ import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
 
 const base = process.env.SELTIVO_SMOKE_URL ?? 'http://127.0.0.1:8787';
-const origin = process.env.SELTIVO_SMOKE_ORIGIN ?? 'https://seltivo.seltivostudio.workers.dev';
+const origin = process.env.SELTIVO_SMOKE_ORIGIN ?? 'https://seltivostudio.com';
 const password = `Smoke-${randomUUID()}!`;
+
+function isLocalTarget(url) {
+  let hostname;
+  try { hostname = new URL(url).hostname; } catch { return false; }
+  return hostname === 'localhost' || hostname === '127.0.0.1' || hostname === '::1' || hostname === '[::1]';
+}
+if (!isLocalTarget(base) && !process.env.SELTIVO_SMOKE_ORIGIN) {
+  throw new Error('SELTIVO_SMOKE_ORIGIN must be set explicitly when SELTIVO_SMOKE_URL points to a non-local Worker; the default Origin would be rejected with 403.');
+}
 
 async function call(method, path, body, cookie, extraHeaders = {}) {
   const response = await fetch(`${base}${path}`, { method, headers: {
@@ -31,7 +40,13 @@ const message = { body: 'Cloudflare runtime check', clientMessageId: randomUUID(
 assert.equal((await call('POST', `/api/v1/requests/${first.body.id}/messages`, message, alice)).status, 201);
 assert.equal((await call('POST', `/api/v1/requests/${first.body.id}/messages`, message, alice)).status, 200);
 assert.equal((await call('GET', `/api/v1/requests/${first.body.id}/messages`, undefined, alice)).body.items.length, 1);
-if (process.env.SELTIVO_SMOKE_ADMIN_EMAIL && process.env.SELTIVO_SMOKE_ADMIN_PASSWORD) {
+// Admin checks mutate state (email retry, status patch) and need an explicit opt-in,
+// not just credentials supplied "by the way".
+const adminAllowed = process.env.SELTIVO_SMOKE_ALLOW_ADMIN === '1';
+if (!adminAllowed && (process.env.SELTIVO_SMOKE_ADMIN_EMAIL || process.env.SELTIVO_SMOKE_ADMIN_PASSWORD)) {
+  throw new Error('Admin credentials supplied without SELTIVO_SMOKE_ALLOW_ADMIN=1. Set SELTIVO_SMOKE_ALLOW_ADMIN=1 explicitly to run the mutating admin checks (email retry / status patch), or unset the credentials.');
+}
+if (adminAllowed && process.env.SELTIVO_SMOKE_ADMIN_EMAIL && process.env.SELTIVO_SMOKE_ADMIN_PASSWORD) {
   const login = await call('POST', '/api/v1/auth/login', { email: process.env.SELTIVO_SMOKE_ADMIN_EMAIL, password: process.env.SELTIVO_SMOKE_ADMIN_PASSWORD });
   assert.equal(login.status, 200);
   const admin = login.cookie;
