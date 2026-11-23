@@ -13,6 +13,7 @@
     "admin:bootstrap": "node dist/bootstrap-admin.js",
     "backup": "node dist/backup.js",
     "backup:verify": "node dist/verify-backup.js",
+    "retention": "node dist/retention.js",
     "typecheck": "tsc --noEmit",
     "test": "node --import tsx --test tests/*.test.ts",
     "dev:cloudflare": "wrangler dev",
