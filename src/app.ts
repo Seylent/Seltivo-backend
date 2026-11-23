@@ -431,7 +431,7 @@ export function buildApp({ db, origin, secureCookies = false, requireEmailVerifi
       }
       return fail(reply, 403, 'Підтвердьте email кодом із листа. Якщо листа немає, надішліть код ще раз.');
     }
-    let updatedRecoveryCodes: string | null = null;
+    let recoveryConsumption: { expected: string; remaining: string } | null = null;
     if (user.role === 'admin') {
       const factor = twoFactorRow(user.id);
       if (factor?.enabled_at) {
@@ -442,18 +442,31 @@ export function buildApp({ db, origin, secureCookies = false, requireEmailVerifi
           recordAttempt(emailLimitKey, 15 * 60_000);
           return fail(reply, 401, 'Невірний email або пароль.');
         }
-        updatedRecoveryCodes = remaining;
+        if (remaining !== null) recoveryConsumption = { expected: factor.recovery_codes, remaining };
       } else if (requireAdmin2FA) {
         return reply.code(403).send({ error: 'Для адміністратора потрібно увімкнути двофакторну авторизацію.', twoFactorEnrollmentRequired: true });
       }
     }
     attempts.delete(emailLimitKey);
-    const token = db.transaction(() => {
-      const previous = sessionTokenFromRequest(request);
-      if (previous) db.prepare('DELETE FROM sessions WHERE token_hash=?').run(hashToken(previous));
-      if (updatedRecoveryCodes !== null) db.prepare('UPDATE admin_two_factor SET recovery_codes=? WHERE user_id=?').run(updatedRecoveryCodes, user.id);
-      return createSession(db, user.id, body.rememberMe, user.role);
-    })();
+    let token: string;
+    try {
+      token = db.transaction(() => {
+        const previous = sessionTokenFromRequest(request);
+        if (previous) db.prepare('DELETE FROM sessions WHERE token_hash=?').run(hashToken(previous));
+        if (recoveryConsumption) {
+          const consumed = db.prepare('UPDATE admin_two_factor SET recovery_codes=? WHERE user_id=? AND recovery_codes=?')
+            .run(recoveryConsumption.remaining, user.id, recoveryConsumption.expected);
+          if (!consumed.changes) throw new Error('RECOVERY_CODE_CONSUMED');
+        }
+        return createSession(db, user.id, body.rememberMe, user.role);
+      })();
+    } catch (error) {
+      if (error instanceof Error && error.message === 'RECOVERY_CODE_CONSUMED') {
+        recordAttempt(emailLimitKey, 15 * 60_000);
+        return fail(reply, 401, 'Невірний email або пароль.');
+      }
+      throw error;
+    }
     if (user.role === 'admin') audit(db, user.id, 'auth.login', 'user', user.id);
     reply.header('Set-Cookie', sessionCookie(token, secureCookies, body.rememberMe, user.role));
     return { user: { id: user.id, email: user.email, name: user.name, role: user.role, emailVerified: Boolean(user.email_verified_at) } };

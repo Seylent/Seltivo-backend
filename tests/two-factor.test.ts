@@ -93,6 +93,26 @@ test('admin enrolls in 2FA, login requires a code, and the session is capped at 
   }
 });
 
+test('concurrent logins cannot mint two sessions from one recovery code', async () => {
+  const db = openDatabase(':memory:');
+  const app = buildApp({ db, origin, logger: false });
+  try {
+    const admin = await addAdmin(db, app, 'admin@example.test');
+    const enrolled = await enroll(app, admin.cookie);
+    const recovery = enrolled.recoveryCodes[0];
+    const results = await Promise.all([
+      call(app, 'POST', '/api/v1/auth/login', { email: admin.email, password, code: recovery }),
+      call(app, 'POST', '/api/v1/auth/login', { email: admin.email, password, code: recovery }),
+    ]);
+    assert.equal(results.filter((result) => result.status === 200).length, 1,
+      'a single-use recovery code may create at most one new session');
+    assert.equal((await call(app, 'GET', '/api/v1/auth/2fa/status', undefined, admin.cookie)).body.recoveryCodesRemaining, 7);
+  } finally {
+    await app.close();
+    db.close();
+  }
+});
+
 test('a recovery code works once and 2FA endpoints are admin-only', async () => {
   const db = openDatabase(':memory:');
   const app = buildApp({ db, origin, logger: false });
