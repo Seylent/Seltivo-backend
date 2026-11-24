@@ -46,12 +46,12 @@ test('wrangler.jsonc pins the hardened production settings at top level', () => 
   assert.equal(prodVars.SELTIVO_PUBLIC_ORIGIN, 'https://seltivostudio.com');
   assert.equal(prodVars.SELTIVO_REQUIRE_EMAIL_VERIFICATION, '1');
   assert.equal(prodVars.SELTIVO_REQUIRE_ADMIN_2FA, '1');
+  // Власник підтвердив увімкнення самообслуговування DELETE /me у production 2026-11-24.
+  assert.equal(prodVars.SELTIVO_ACCOUNT_DELETION_ENABLED, '1');
 });
 
 test('wrangler.jsonc keeps staging-only flags out of production vars', () => {
-  for (const flag of ['SELTIVO_STAGING', 'SELTIVO_ACCOUNT_DELETION_ENABLED']) {
-    assert.equal(prodVars[flag], undefined, `Staging-only flag ${flag} must not be moved into prod vars`);
-  }
+  assert.equal(prodVars.SELTIVO_STAGING, undefined, 'Staging-only flag SELTIVO_STAGING must not be moved into prod vars');
 });
 
 test('wrangler.jsonc production vars carry no secret-named keys', () => {

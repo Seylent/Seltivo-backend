@@ -11,9 +11,10 @@
     "SELTIVO_ADMIN_EMAIL": "seltivostudio@gmail.com",
     "SELTIVO_REQUIRE_EMAIL_VERIFICATION": "1",
     // Власник підтвердив підключення 2FA для всіх production-адміністраторів 2026-11-22.
-    "SELTIVO_REQUIRE_ADMIN_2FA": "1"
-    // Self-service DELETE /api/v1/me вимкнено: увімкнути "SELTIVO_ACCOUNT_DELETION_ENABLED": "1"
-    // лише після перевірки restore та незалежних копій (docs/cloudflare-operations.md:33-35).
+    "SELTIVO_REQUIRE_ADMIN_2FA": "1",
+    // Self-service DELETE /api/v1/me увімкнено 2026-11-24 за підтвердженням власника
+    // після перевірки restore на staging та наявності незалежних копій.
+    "SELTIVO_ACCOUNT_DELETION_ENABLED": "1"
   },
   "durable_objects": {
     "bindings": [
