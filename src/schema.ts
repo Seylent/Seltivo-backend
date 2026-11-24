@@ -144,4 +144,15 @@ export const MIGRATIONS = [
   { version: 10, sql: `
     ALTER TABLE users ADD COLUMN locale TEXT CHECK(locale IS NULL OR locale IN ('uk','en'));
   ` },
+  // Блокування входу/квоти мають пережити рестарт Durable Object. Ключ зберігається
+  // лише як SHA-256 (без email), а таблиця не входить у логічні бекапи.
+  { version: 11, sql: `
+    CREATE TABLE IF NOT EXISTS rate_limit_hits (
+      key_hash TEXT NOT NULL,
+      at INTEGER NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS rate_limit_hits_key ON rate_limit_hits(key_hash, at);
+    CREATE INDEX IF NOT EXISTS rate_limit_hits_at ON rate_limit_hits(at);
+    ALTER TABLE admin_two_factor ADD COLUMN last_totp_step INTEGER;
+  ` },
 ] as const;

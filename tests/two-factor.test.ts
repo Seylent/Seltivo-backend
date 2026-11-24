@@ -73,17 +73,19 @@ test('admin enrolls in 2FA, login requires a code, and the session is capped at 
 
     const wrong = await call(app, 'POST', '/api/v1/auth/login', { email: admin.email, password, code: '000000' });
     assert.equal(wrong.status, 401);
-    const valid = await call(app, 'POST', '/api/v1/auth/login', { email: admin.email, password, code: totpAt(enrolled.secret) });
+    // Кожен TOTP-код приймається один раз (RFC 6238 §5.2): код увімкнення вже
+    // використано, тому вхід бере код наступного 30-секундного кроку.
+    const valid = await call(app, 'POST', '/api/v1/auth/login', { email: admin.email, password, code: totpAt(enrolled.secret, Date.now() + 30_000) });
     assert.equal(valid.status, 200);
     const session = db.prepare('SELECT expires_at FROM sessions WHERE user_id=(SELECT id FROM users WHERE email=?)').get(admin.email) as { expires_at: string };
     assert.ok(Date.parse(session.expires_at) - Date.now() <= 12 * 60 * 60 * 1000);
 
-    const remembered = await call(app, 'POST', '/api/v1/auth/login', { email: admin.email, password, rememberMe: true, code: totpAt(enrolled.secret) });
+    const remembered = await call(app, 'POST', '/api/v1/auth/login', { email: admin.email, password, rememberMe: true, code: enrolled.recoveryCodes[0] });
     assert.equal(remembered.status, 200);
     assert.match(String(remembered.cookie), /Max-Age=43200/);
     assert.doesNotMatch(String(remembered.cookie), /Max-Age=2592000/);
 
-    const disabled = await call(app, 'POST', '/api/v1/auth/2fa/disable', { password, code: totpAt(enrolled.secret) }, admin.cookie);
+    const disabled = await call(app, 'POST', '/api/v1/auth/2fa/disable', { password, code: enrolled.recoveryCodes[1] }, admin.cookie);
     assert.equal(disabled.status, 200);
     assert.equal((await call(app, 'GET', '/api/v1/auth/2fa/status', undefined, admin.cookie)).body.enabled, false);
     assert.equal((await call(app, 'POST', '/api/v1/auth/login', { email: admin.email, password })).status, 200);

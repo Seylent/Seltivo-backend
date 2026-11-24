@@ -2,9 +2,10 @@ import nodemailer from 'nodemailer';
 import { openDatabase } from './db.js';
 import { buildApp } from './app.js';
 import { purgeCustomer } from './delete-account.js';
-import { recordLocalDeletion, replayLocalDeletions } from './local-deletion-ledger.js';
+import { recordLocalDeletion, recordLocalRequestDeletion, replayLocalDeletions } from './local-deletion-ledger.js';
+import { createNotificationDelivery } from './notifications.js';
 import { redactDevMail } from './dev-mail.js';
-import { deriveServerSecurity } from './server-config.js';
+import { deriveServerSecurity, requireMailForVerification } from './server-config.js';
 
 const origin = process.env.SELTIVO_PUBLIC_ORIGIN;
 if (!origin) throw new Error('SELTIVO_PUBLIC_ORIGIN is required');
@@ -21,6 +22,7 @@ const smtp = process.env.SMTP_HOST && process.env.SMTP_USER && process.env.SMTP_
       auth: { user: process.env.SMTP_USER, pass: process.env.SMTP_PASSWORD },
     }) : null;
 const { secureCookies, devMail } = deriveServerSecurity(origin, process.env);
+requireMailForVerification(process.env, Boolean(smtp || devMail));
 const selfServiceDeletionEnabled = process.env.SELTIVO_ACCOUNT_DELETION_ENABLED === '1';
 // Після restore старої БД видалені акаунти мають зникнути знову — це стосується
 // і видалень, зроблених адміністратором, навіть коли самообслуговування вимкнено.
@@ -33,6 +35,11 @@ const deleteCustomer = async (userId: string) => {
   recordLocalDeletion(userId);
   purgeCustomer(db, userId);
 };
+const sendMail: Parameters<typeof buildApp>[0]['sendMail'] = smtp ? async (to, subject, text, html) => { await smtp.sendMail({ from: process.env.SMTP_FROM, to, subject, text, ...(html ? { html } : {}) }); }
+  : devMail ? async (to, subject, text) => {
+    // Dev-консоль часто потрапляє в логи — коди й токени друкувати не можна.
+    console.log(`DEV MAIL to ${to}: ${redactDevMail(subject)}\n${redactDevMail(text)}`);
+  } : undefined;
 const app = buildApp({
   db,
   origin,
@@ -41,13 +48,13 @@ const app = buildApp({
   teamEmail: process.env.SELTIVO_TEAM_EMAIL,
   databaseBytes: () => (db.pragma('page_count', { simple: true }) as number) * (db.pragma('page_size', { simple: true }) as number),
   deleteCustomer,
+  recordRequestDeletion: async (requestId) => { recordLocalRequestDeletion(requestId); },
   selfServiceDeletionEnabled,
-  sendMail: smtp ? async (to, subject, text, html) => { await smtp.sendMail({ from: process.env.SMTP_FROM, to, subject, text, ...(html ? { html } : {}) }); }
-    : devMail ? async (to, subject, text) => {
-      // Dev-консоль часто потрапляє в логи — коди й токени друкувати не можна.
-      console.log(`DEV MAIL to ${to}: ${redactDevMail(subject)}\n${redactDevMail(text)}`);
-    } : undefined,
+  sendMail,
 });
+// Погодинний повтор недоставлених листів чату (як cron у Worker).
+const notifications = createNotificationDelivery({ db, origin, sendMail, log: (entry) => app.log.error(entry) });
+setInterval(() => { notifications.retryDue().catch(() => app.log.error({ event: 'email_retry_failed' })); }, 60 * 60_000).unref();
 const port = Number(process.env.PORT ?? 4000);
 await app.listen({ host: process.env.HOST ?? '127.0.0.1', port });
 process.on('SIGTERM', async () => { await app.close(); db.close(); });

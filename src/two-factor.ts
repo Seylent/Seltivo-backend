@@ -51,13 +51,18 @@ export function totpAt(secret: string, atMs = Date.now()): string {
 
 /** RFC 6238: приймаємо поточний крок і сусідні (±30 с) для зсуву годинника. */
 export function verifyTotp(code: string, secret: string, atMs = Date.now()): boolean {
-  if (!/^\d{6}$/.test(code)) return false;
+  return matchTotpStep(code, secret, atMs) !== null;
+}
+
+/** Повертає крок часу, якому відповідає код, щоб викликач міг заборонити його повторне використання. */
+export function matchTotpStep(code: string, secret: string, atMs = Date.now()): number | null {
+  if (!/^\d{6}$/.test(code)) return null;
   const step = Math.floor(atMs / STEP_MS);
   const expected = Buffer.from(code);
   for (const delta of [0, -1, 1]) {
-    if (timingSafeEqual(expected, Buffer.from(hotp(secret, step + delta)))) return true;
+    if (timingSafeEqual(expected, Buffer.from(hotp(secret, step + delta)))) return step + delta;
   }
-  return false;
+  return null;
 }
 
 export function generateRecoveryCodes(count = 8): string[] {

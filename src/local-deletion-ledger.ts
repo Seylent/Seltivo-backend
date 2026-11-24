@@ -1,7 +1,7 @@
 import { appendFileSync, existsSync, mkdirSync, readFileSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 import type { SeltivoDb } from './db.js';
-import { purgeCustomer } from './delete-account.js';
+import { purgeCustomer, purgeRequest } from './delete-account.js';
 
 /**
  * Локальний (Node) журнал видалень. Лежить ОКРЕМО від SQLite-файлу, тож
@@ -17,11 +17,21 @@ export function recordLocalDeletion(userId: string): void {
   appendFileSync(path, `${userId}\n`, 'utf8');
 }
 
-/** Повертає кількість унікальних ID у журналі (для логів/тестів). */
+/** Повертає кількість унікальних записів у журналі (для логів/тестів). */
 export function replayLocalDeletions(db: SeltivoDb): number {
   const path = ledgerPath();
   if (!existsSync(path)) return 0;
-  const ids = [...new Set(readFileSync(path, 'utf8').split('\n').map((line) => line.trim()).filter((line) => /^[a-f0-9-]{36}$/i.test(line)))];
-  for (const id of ids) purgeCustomer(db, id);
-  return ids.length;
+  const lines = [...new Set(readFileSync(path, 'utf8').split('\n').map((line) => line.trim()))];
+  const customers = lines.filter((line) => /^[a-f0-9-]{36}$/i.test(line));
+  const requests = lines.filter((line) => /^request:[a-f0-9-]{36}$/i.test(line)).map((line) => line.slice('request:'.length));
+  for (const id of customers) purgeCustomer(db, id);
+  for (const id of requests) purgeRequest(db, id);
+  return customers.length + requests.length;
+}
+
+/** Заявка, видалена клієнтом: окремий префікс, старий код такі рядки ігнорує. */
+export function recordLocalRequestDeletion(requestId: string): void {
+  const path = ledgerPath();
+  mkdirSync(dirname(path), { recursive: true });
+  appendFileSync(path, `request:${requestId}\n`, 'utf8');
 }

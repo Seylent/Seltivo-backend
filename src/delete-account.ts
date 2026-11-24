@@ -18,3 +18,12 @@ export function purgeCustomer(db: SeltivoDb, userId: string): void {
     if ((db.pragma('foreign_key_check') as unknown[]).length) throw new Error('Foreign key violation after customer purge');
   })();
 }
+
+// Повторне видалення заявки після restore/PITR. Діалог, повідомлення, історія
+// статусів і сповіщення видаляються каскадом; безпечно викликати повторно.
+export function purgeRequest(db: SeltivoDb, requestId: string): void {
+  db.transaction(() => {
+    db.prepare('DELETE FROM requests WHERE id=?').run(requestId);
+    if ((db.pragma('foreign_key_check') as unknown[]).length) throw new Error('Foreign key violation after request purge');
+  })();
+}

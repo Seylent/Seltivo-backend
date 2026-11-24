@@ -3,11 +3,12 @@ import Fastify, { type FastifyInstance, type FastifyReply, type FastifyRequest }
 import { z } from 'zod';
 import type { SeltivoDb } from './db.js';
 import { actorFromRequest, audit, clearSessionCookie, createSession, hashPassword, hashToken, newAuthToken, newEmailCode, normalizeEmail, now, sessionCookie, sessionTokenFromRequest, verifyPassword, type Actor } from './auth.js';
-import { generateRecoveryCodes, generateTotpSecret, normalizeRecoveryCode, otpauthUri, verifyTotp } from './two-factor.js';
+import { generateRecoveryCodes, generateTotpSecret, matchTotpStep, normalizeRecoveryCode, otpauthUri } from './two-factor.js';
 import { trialSnapshot } from './trial.js';
 import { createChatEvents } from './chat-events.js';
 import { renderEmail } from './emails.js';
 import { accountPayloadBytes, defaultDataLimits, exportAccount, type DataLimits } from './data-controls.js';
+import { createNotificationDelivery, type Mail } from './notifications.js';
 
 const id = z.uuid();
 const email = z.email().max(254);
@@ -48,8 +49,7 @@ export function tokenHashesEqual(supplied: string, expected: string): boolean {
   return left.length === 32 && right.length === 32 && timingSafeEqual(left, right);
 }
 
-type Mail = (to: string, subject: string, text: string, html?: string) => Promise<void>;
-export type AppOptions = { db: SeltivoDb; origin: string; secureCookies?: boolean; requireEmailVerification?: boolean; requireAdmin2FA?: boolean; sendMail?: Mail; teamEmail?: string; databaseBytes?: () => number; deleteCustomer?: (userId: string) => Promise<void>; selfServiceDeletionEnabled?: boolean; logger?: boolean; router?: FastifyInstance; dataLimits?: Partial<DataLimits> };
+export type AppOptions = { db: SeltivoDb; origin: string; secureCookies?: boolean; requireEmailVerification?: boolean; requireAdmin2FA?: boolean; sendMail?: Mail; teamEmail?: string; databaseBytes?: () => number; deleteCustomer?: (userId: string) => Promise<void>; recordRequestDeletion?: (requestId: string) => Promise<void>; selfServiceDeletionEnabled?: boolean; logger?: boolean; router?: FastifyInstance; dataLimits?: Partial<DataLimits> };
 const MAX_CONFIGURATIONS_PER_USER = 50;
 /** Автовідповідь у чаті, поки менеджер ще не відповів особисто. Мова = мова інтерфейсу клієнта. */
 const CHAT_AUTOREPLY = {
@@ -120,8 +120,10 @@ function configJson(value: unknown, templateId: string): string | null {
   return Buffer.byteLength(json) <= 8 * 1024 * 1024 ? json : null;
 }
 
-export function buildApp({ db, origin, secureCookies = false, requireEmailVerification = process.env.SELTIVO_REQUIRE_EMAIL_VERIFICATION === '1', requireAdmin2FA = process.env.SELTIVO_REQUIRE_ADMIN_2FA === '1', sendMail, teamEmail, databaseBytes, deleteCustomer, selfServiceDeletionEnabled = true, logger = process.env.NODE_ENV !== 'test', router, dataLimits }: AppOptions) {
-  const app = router ?? Fastify({ logger, bodyLimit: 9 * 1024 * 1024, trustProxy: process.env.SELTIVO_TRUST_PROXY === '1' });
+export function buildApp({ db, origin, secureCookies = false, requireEmailVerification = process.env.SELTIVO_REQUIRE_EMAIL_VERIFICATION === '1', requireAdmin2FA = process.env.SELTIVO_REQUIRE_ADMIN_2FA === '1', sendMail, teamEmail, databaseBytes, deleteCustomer, recordRequestDeletion, selfServiceDeletionEnabled = true, logger = process.env.NODE_ENV !== 'test', router, dataLimits }: AppOptions) {
+  // Довіряємо рівно одному проксі: `true` взяв би крайню ліву адресу з
+  // X-Forwarded-For, яку клієнт підставляє сам, і обходив би per-IP ліміти.
+  const app = router ?? Fastify({ logger, bodyLimit: 9 * 1024 * 1024, trustProxy: process.env.SELTIVO_TRUST_PROXY === '1' ? (_address: string, hop: number) => hop < 1 : false });
   const limits = { ...defaultDataLimits, ...dataLimits };
   if (Object.values(limits).some((value) => !Number.isSafeInteger(value) || value < 1)) throw new Error('Invalid data limits');
   const storageAvailable = (reply: FastifyReply) => {
@@ -140,16 +142,16 @@ export function buildApp({ db, origin, secureCookies = false, requireEmailVerifi
   };
   const chatEvents = createChatEvents();
   /** Each entry keeps the window it was recorded with, so staleness pruning uses
-   * that key's own window (e.g. 1 hour for exports) instead of a fixed 15 minutes. */
+   * that key's own window instead of a fixed one. */
   type RateEntry = { times: number[]; windowMs: number };
   const RATE_LIMIT_MAX_KEYS = 10_000;
   const RATE_LIMIT_TRIM_TO = 9_000;
-  // Two separate key spaces: IP/global keys are attacker-controlled and safe to
-  // evict; email/export keys are security locks whose lockouts/quotas must survive.
+  // Два простори ключів. IP/глобальні ключі контролює атакувальник — вони живуть у
+  // пам'яті й можуть витіснятися. Email/export ключі — це блокування й квоти: вони
+  // зберігаються в SQLite (лише SHA-256 ключа), тож переживають рестарт Durable Object.
   const attempts = new Map<string, RateEntry>();
-  const sensitiveAttempts = new Map<string, RateEntry>();
+  const SENSITIVE_RETENTION_MS = 60 * 60_000;
   const isSensitiveKey = (key: string) => key.startsWith('email:') || key.startsWith('export:');
-  const storeFor = (key: string) => isSensitiveKey(key) ? sensitiveAttempts : attempts;
   /** Reclaims capacity in the IP/global map. Never rejects: every key there is
    * safe to evict, so prune expired entries then drop the oldest until there is room. */
   const makeRoomInGlobal = (current: number) => {
@@ -163,53 +165,43 @@ export function buildApp({ db, origin, secureCookies = false, requireEmailVerifi
       attempts.delete(key);
     }
   };
-  /** Reclaims capacity in the sensitive map by dropping only expired locks.
-   * Returns false when every key is still live — the caller then allows the new
-   * key without recording it, so capacity can never produce a 429. */
-  const makeRoomInSensitive = (current: number): boolean => {
-    if (sensitiveAttempts.size < RATE_LIMIT_MAX_KEYS) return true;
-    for (const [key, entry] of sensitiveAttempts) {
-      if (!entry.times.some((time) => current - time < entry.windowMs)) sensitiveAttempts.delete(key);
+  const recentHits = (key: string, windowMs: number, current: number): number[] => {
+    if (!isSensitiveKey(key)) return (attempts.get(key)?.times ?? []).filter((time) => current - time < windowMs);
+    if (windowMs > SENSITIVE_RETENTION_MS) throw new Error('Sensitive rate-limit window exceeds retention');
+    return (db.prepare('SELECT at FROM rate_limit_hits WHERE key_hash=? AND at>? ORDER BY at').all(hashToken(key), current - windowMs) as { at: number }[])
+      .map((row) => Number(row.at));
+  };
+  const addHit = (key: string, windowMs: number, current: number, recent: number[]) => {
+    if (isSensitiveKey(key)) {
+      db.prepare('DELETE FROM rate_limit_hits WHERE at<=?').run(current - SENSITIVE_RETENTION_MS);
+      db.prepare('INSERT INTO rate_limit_hits(key_hash,at) VALUES (?,?)').run(hashToken(key), current);
+      return;
     }
-    return sensitiveAttempts.size < RATE_LIMIT_MAX_KEYS;
+    if (!attempts.has(key)) makeRoomInGlobal(current);
+    attempts.set(key, { times: [...recent, current], windowMs });
+  };
+  const clearRateLimit = (key: string) => {
+    if (isSensitiveKey(key)) db.prepare('DELETE FROM rate_limit_hits WHERE key_hash=?').run(hashToken(key));
+    else attempts.delete(key);
   };
   const checkRateLimit = (key: string, windowMs: number, max: number, reply: FastifyReply, record = true): boolean => {
     const current = Date.now();
-    const store = storeFor(key);
-    const entry = store.get(key);
-    const recent = (entry?.times ?? []).filter((time) => current - time < windowMs);
+    const recent = recentHits(key, windowMs, current);
     if (recent.length >= max) {
       reply.header('Retry-After', String(Math.max(1, Math.ceil((windowMs - (current - recent[0])) / 1000))));
       fail(reply, 429, 'Забагато запитів. Спробуйте пізніше.');
       return false;
     }
-    if (!entry) {
-      if (store === sensitiveAttempts) {
-        // A brand-new sensitive key must not evict a live lockout/quota. When the
-        // map is full, allow the request but do not start tracking this key.
-        if (!makeRoomInSensitive(current)) return true;
-      } else {
-        makeRoomInGlobal(current);
-      }
+    if (record) addHit(key, windowMs, current, recent);
+    else if (!isSensitiveKey(key)) {
+      if (recent.length) attempts.set(key, { times: recent, windowMs });
+      else attempts.delete(key);
     }
-    if (record) store.set(key, { times: [...recent, current], windowMs });
-    else if (recent.length) store.set(key, { times: recent, windowMs });
-    else store.delete(key);
     return true;
   };
   const recordAttempt = (key: string, windowMs: number) => {
     const current = Date.now();
-    const store = storeFor(key);
-    const entry = store.get(key);
-    const recent = (entry?.times ?? []).filter((time) => current - time < windowMs);
-    if (!entry) {
-      if (store === sensitiveAttempts) {
-        if (!makeRoomInSensitive(current)) return;
-      } else {
-        makeRoomInGlobal(current);
-      }
-    }
-    store.set(key, { times: [...recent, current], windowMs });
+    addHit(key, windowMs, current, recentHits(key, windowMs, current));
   };
   const rateLimitBucket = (method: string, rawPath: string): { bucket: string; windowMs: number; max: number } | null => {
     const path = rawPath.length > 1 ? rawPath.replace(/\/+$/, '') : rawPath;
@@ -245,43 +237,7 @@ export function buildApp({ db, origin, secureCookies = false, requireEmailVerifi
     if (!sendMail) return false;
     try { await sendMail(to, subject, text, html); return true; } catch { app.log.error({ event: 'email_delivery_failed', kind: 'auth' }); return false; }
   };
-  const deliverNotification = async (notificationId: string): Promise<'sent' | 'failed' | 'busy' | 'missing'> => {
-    const started = now();
-    const stale = new Date(Date.now() - 2 * 60_000).toISOString();
-    const claimed = db.prepare(`UPDATE email_notifications SET status='sending',attempts=attempts+1,last_attempt_at=?,last_error_code=NULL
-      WHERE id=? AND (status IN ('pending','failed') OR (status='sending' AND last_attempt_at<?))`).run(started, notificationId, stale);
-    if (!claimed.changes) {
-      const row = db.prepare('SELECT status FROM email_notifications WHERE id=?').get(notificationId) as { status: string } | undefined;
-      return row ? 'busy' : 'missing';
-    }
-    const row = db.prepare(`SELECT n.recipient,r.id request_id,u.role sender_role,
-      (SELECT locale FROM users WHERE email=n.recipient) AS recipient_locale FROM email_notifications n
-      JOIN messages m ON m.id=n.message_id JOIN users u ON u.id=m.sender_id
-      JOIN conversations c ON c.id=m.conversation_id JOIN requests r ON r.id=c.request_id WHERE n.id=?`)
-      .get(notificationId) as { recipient: string; request_id: string; sender_role: string; recipient_locale: string | null } | undefined;
-    if (!row) return 'missing';
-    const customer = row.sender_role === 'admin';
-    const message = renderEmail('chat-message', {
-      origin,
-      requestId: row.request_id,
-      customerReply: customer,
-      url: `${origin}/${customer ? 'account' : 'admin'}/requests/${row.request_id}`,
-    }, row.recipient_locale);
-    try {
-      if (!sendMail) throw new Error('mail_not_configured');
-      await sendMail(row.recipient, message.subject, message.text, message.html);
-      const sentAt = now();
-      const retentionCutoff = new Date(Date.now() - RETENTION_MS).toISOString();
-      db.prepare("UPDATE email_notifications SET status='sent',sent_at=?,last_error_code=NULL WHERE id=?").run(sentAt, notificationId);
-      db.prepare("DELETE FROM email_notifications WHERE status='sent' AND sent_at<?").run(retentionCutoff);
-      return 'sent';
-    } catch {
-      const code = sendMail ? 'provider_error' : 'mail_not_configured';
-      db.prepare("UPDATE email_notifications SET status='failed',last_error_code=? WHERE id=?").run(code, notificationId);
-      app.log.error({ event: 'email_delivery_failed', kind: 'chat', notificationId, code });
-      return 'failed';
-    }
-  };
+  const deliverNotification = createNotificationDelivery({ db, origin, sendMail, log: (entry) => app.log.error(entry) }).deliver;
   type TwoFactorRow = { secret: string; enabled_at: string | null; recovery_codes: string };
   const twoFactorRow = (userId: string) => db.prepare('SELECT secret,enabled_at,recovery_codes FROM admin_two_factor WHERE user_id=?').get(userId) as TwoFactorRow | undefined;
   const consumeRecoveryCode = (codesJson: string, code: string) => {
@@ -293,6 +249,15 @@ export function buildApp({ db, origin, secureCookies = false, requireEmailVerifi
     if (index < 0) return null;
     codes.splice(index, 1);
     return JSON.stringify(codes);
+  };
+  // RFC 6238 §5.2: прийнятий код не можна використати вдруге. Кроки зростають
+  // монотонно, тож зберігаємо останній прийнятий крок у БД (переживає рестарт
+  // Durable Object), а умовний UPDATE робить перевірку атомарною.
+  const acceptTotp = (userId: string, code: string, secret: string) => {
+    const step = matchTotpStep(code, secret);
+    if (step === null) return false;
+    return db.prepare('UPDATE admin_two_factor SET last_totp_step=? WHERE user_id=? AND (last_totp_step IS NULL OR last_totp_step<?)')
+      .run(step, userId, step).changes > 0;
   };
   const recoveryRemaining = (codesJson: string) => {
     try {
@@ -318,7 +283,9 @@ export function buildApp({ db, origin, secureCookies = false, requireEmailVerifi
     if (['POST', 'PATCH', 'PUT', 'DELETE'].includes(request.method) && request.headers.origin !== origin) {
       return fail(reply, 403, 'Невірне джерело запиту.');
     }
-    const rawPath = request.url.split('?')[0];
+    // Шаблон маршруту (`/api/v1/requests/:id/messages`), а не сирий URL: router
+    // декодує percent-encoding, тож `/guest-request%73` інакше відкривав би новий bucket.
+    const rawPath = request.routeOptions?.url ?? request.url.split('?')[0];
     const limit = rateLimitBucket(request.method, rawPath);
     if (limit) {
       checkRateLimit(`${request.ip}:${limit.bucket}`, limit.windowMs, limit.max, reply);
@@ -345,6 +312,19 @@ export function buildApp({ db, origin, secureCookies = false, requireEmailVerifi
     return fail(reply, 500, 'Помилка сервера.');
   });
   let healthCache = { ok: true, checkedAt: 0 };
+  // quick_check і foreign_key_check проходять усю базу й блокують єдиний Durable
+  // Object. Дашборд показує результат не старший за 5 хв; diagnostics завжди свіжий.
+  let integrityCache: { integrity: unknown; foreignKeyViolations: number; checkedAt: number } | null = null;
+  const integrityReport = (fresh: boolean) => {
+    if (fresh || !integrityCache || Date.now() - integrityCache.checkedAt > 5 * 60_000) {
+      integrityCache = {
+        integrity: db.pragma('quick_check', { simple: true }),
+        foreignKeyViolations: (db.pragma('foreign_key_check') as unknown[]).length,
+        checkedAt: Date.now(),
+      };
+    }
+    return integrityCache;
+  };
   app.get('/api/v1/health', async () => {
     // quick_check на великій базі недешевий, а endpoint публічний: кешуємо результат,
     // щоб запитами не можна було зайняти єдиний Durable Object.
@@ -486,7 +466,7 @@ export function buildApp({ db, origin, secureCookies = false, requireEmailVerifi
         if (!body.code) return reply.code(428).send({ error: 'Введіть код з застосунку авторизації.', twoFactorRequired: true });
         const code = body.code.trim();
         const remaining = /^[A-Za-z0-9-]{8,20}$/.test(code) ? consumeRecoveryCode(factor.recovery_codes, code) : null;
-        if (remaining === null && !verifyTotp(code, factor.secret)) {
+        if (remaining === null && !acceptTotp(user.id, code, factor.secret)) {
           recordAttempt(emailLimitKey, 15 * 60_000);
           return fail(reply, 401, 'Невірний email або пароль.');
         }
@@ -495,7 +475,7 @@ export function buildApp({ db, origin, secureCookies = false, requireEmailVerifi
         return reply.code(403).send({ error: 'Для адміністратора потрібно увімкнути двофакторну авторизацію.', twoFactorEnrollmentRequired: true });
       }
     }
-    storeFor(emailLimitKey).delete(emailLimitKey);
+    clearRateLimit(emailLimitKey);
     let token: string;
     try {
       token = db.transaction(() => {
@@ -549,7 +529,7 @@ export function buildApp({ db, origin, secureCookies = false, requireEmailVerifi
     const recoveryCodes = generateRecoveryCodes();
     const hashes = JSON.stringify(recoveryCodes.map((code) => hashToken(normalizeRecoveryCode(code))));
     db.prepare(`INSERT INTO admin_two_factor(user_id,secret,enabled_at,recovery_codes) VALUES (?,?,NULL,?)
-      ON CONFLICT(user_id) DO UPDATE SET secret=excluded.secret,recovery_codes=excluded.recovery_codes,enabled_at=NULL`)
+      ON CONFLICT(user_id) DO UPDATE SET secret=excluded.secret,recovery_codes=excluded.recovery_codes,enabled_at=NULL,last_totp_step=NULL`)
       .run(actor.id, secret, hashes);
     audit(db, actor.id, 'auth.2fa.setup', 'user', actor.id);
     return { secret, uri: otpauthUri(secret, actor.email), recoveryCodes };
@@ -561,7 +541,7 @@ export function buildApp({ db, origin, secureCookies = false, requireEmailVerifi
     if (!checkRateLimit(limitKey, 15 * 60_000, 5, reply, false)) return;
     const factor = twoFactorRow(actor.id);
     if (!factor || factor.enabled_at) return fail(reply, 409, 'Спочатку налаштуйте 2FA.');
-    if (!verifyTotp(body.code, factor.secret)) {
+    if (!acceptTotp(actor.id, body.code, factor.secret)) {
       recordAttempt(limitKey, 15 * 60_000);
       return fail(reply, 422, 'Невірний код.');
     }
@@ -584,7 +564,7 @@ export function buildApp({ db, origin, secureCookies = false, requireEmailVerifi
     if (!factor?.enabled_at) return fail(reply, 409, '2FA не увімкнено.');
     const code = body.code.trim();
     const remaining = /^[A-Za-z0-9-]{8,20}$/.test(code) ? consumeRecoveryCode(factor.recovery_codes, code) : null;
-    if (remaining === null && !verifyTotp(code, factor.secret)) {
+    if (remaining === null && !acceptTotp(actor.id, code, factor.secret)) {
       recordAttempt(limitKey, 15 * 60_000);
       return fail(reply, 422, 'Невірний код.');
     }
@@ -612,14 +592,21 @@ export function buildApp({ db, origin, secureCookies = false, requireEmailVerifi
   app.post('/api/v1/auth/reset-password', async (request, reply) => {
     const body = parse(z.object({ token: z.string().min(20).max(100), password }).strict(), request.body, reply);
     if (!body) return;
-    const row = db.prepare("SELECT user_id FROM auth_tokens WHERE token_hash=? AND purpose='reset' AND expires_at>?").get(hashToken(body.token), now()) as { user_id: string } | undefined;
+    const tokenHash = hashToken(body.token);
+    const row = db.prepare("SELECT user_id FROM auth_tokens WHERE token_hash=? AND purpose='reset' AND expires_at>?").get(tokenHash, now()) as { user_id: string } | undefined;
     if (!row) return fail(reply, 422, 'Посилання недійсне або прострочене.');
     const hash = await hashPassword(body.password);
-    db.transaction(() => {
+    // Під час хешування паралельний запит міг уже використати цей самий токен:
+    // споживаємо його атомарно в транзакції, а не покладаємося на SELECT вище.
+    const consumed = db.transaction(() => {
+      const removed = db.prepare("DELETE FROM auth_tokens WHERE token_hash=? AND purpose='reset' AND expires_at>?").run(tokenHash, now());
+      if (!removed.changes) return false;
       db.prepare('UPDATE users SET password_hash=?,updated_at=? WHERE id=?').run(hash, now(), row.user_id);
       db.prepare('DELETE FROM auth_tokens WHERE user_id=?').run(row.user_id);
       db.prepare('DELETE FROM sessions WHERE user_id=?').run(row.user_id);
+      return true;
     })();
+    if (!consumed) return fail(reply, 422, 'Посилання недійсне або прострочене.');
     return { ok: true };
   });
   app.get('/api/v1/me', async (request, reply) => {
@@ -798,6 +785,14 @@ export function buildApp({ db, origin, secureCookies = false, requireEmailVerifi
     const requestId = (request.params as any).id;
     const row = db.prepare('SELECT id FROM requests WHERE id=? AND customer_id=?').get(requestId, actor.id);
     if (!row) return fail(reply, 404, 'Не знайдено.');
+    // Спершу журнал видалень поза основною БД: інакше відновлення з бекапу/PITR
+    // повернуло б заявку, яку клієнт уже видалив. Без запису в журнал не видаляємо.
+    if (recordRequestDeletion) {
+      try { await recordRequestDeletion(requestId); } catch {
+        app.log.error({ event: 'request_deletion_ledger_failed' });
+        return fail(reply, 503, 'Видалення тимчасово недоступне. Спробуйте пізніше.');
+      }
+    }
     db.transaction(() => {
       db.prepare('DELETE FROM requests WHERE id=? AND customer_id=?').run(requestId, actor.id);
       db.prepare('INSERT INTO audit_log(id,actor_id,action,entity_type,entity_id,created_at) VALUES (?,?,?,?,?,?)')
@@ -904,7 +899,8 @@ export function buildApp({ db, origin, secureCookies = false, requireEmailVerifi
       JOIN messages m ON m.conversation_id=c.id AND m.sender_id<>?
       LEFT JOIN conversation_reads cr ON cr.conversation_id=c.id AND cr.user_id=?
       WHERE (r.customer_id=? OR ?='admin') AND m.id>COALESCE(cr.last_read_message_id,0)
-      GROUP BY r.id`).all(actor.id, actor.id, actor.id, actor.role) as { requestId: string; unread: number }[];
+        AND (?<>'admin' OR m.client_message_id NOT LIKE '${AUTOREPLY_KEY_PREFIX}%')
+      GROUP BY r.id`).all(actor.id, actor.id, actor.id, actor.role, actor.role) as { requestId: string; unread: number }[];
     const value = { total: rows.reduce((sum, row) => sum + row.unread, 0), byRequest: rows };
     if (unreadCache.size > 5_000) {
       for (const [idKey, entry] of unreadCache) {
@@ -1066,9 +1062,8 @@ export function buildApp({ db, origin, secureCookies = false, requireEmailVerifi
   });
   app.get('/api/v1/admin/diagnostics', async (request, reply) => {
     if (!auth(request, reply, 'admin')) return;
-    const integrity = db.pragma('quick_check', { simple: true });
-    const foreignKeys = (db.pragma('foreign_key_check') as unknown[]).length;
-    return { ok: integrity === 'ok' && foreignKeys === 0, integrity, foreignKeyViolations: foreignKeys,
+    const { integrity, foreignKeyViolations } = integrityReport(true);
+    return { ok: integrity === 'ok' && foreignKeyViolations === 0, integrity, foreignKeyViolations,
       databaseBytes: databaseBytes?.() ?? null, emailConfigured: Boolean(sendMail) };
   });
   app.get('/api/v1/admin/overview', async (request, reply) => {
@@ -1086,13 +1081,14 @@ export function buildApp({ db, origin, secureCookies = false, requireEmailVerifi
       FROM requests`).get(since) as Record<string, number | null>;
     const customers = db.prepare(`SELECT COUNT(*) total, SUM(CASE WHEN created_at>=? THEN 1 ELSE 0 END) last7Days
       FROM users WHERE role='customer'`).get(since) as { total: number | null; last7Days: number | null };
+    // Автовідповідь — службове повідомлення: вона не є непрочитаним для менеджерів
+    // і не закриває чергу «очікують відповіді» — там має бути жива відповідь менеджера.
+    const notAutoreply = `m.client_message_id NOT LIKE '${AUTOREPLY_KEY_PREFIX}%'`;
     const unread = db.prepare(`SELECT COUNT(m.id) total FROM requests r
       JOIN conversations c ON c.request_id=r.id
       JOIN messages m ON m.conversation_id=c.id AND m.sender_id<>?
       LEFT JOIN conversation_reads cr ON cr.conversation_id=c.id AND cr.user_id=?
-      WHERE m.id>COALESCE(cr.last_read_message_id,0)`).get(actor.id, actor.id) as { total: number | null };
-    // Автовідповідь не закриває чергу «очікують відповіді» — там має бути жива відповідь менеджера.
-    const notAutoreply = `m.client_message_id NOT LIKE '${AUTOREPLY_KEY_PREFIX}%'`;
+      WHERE m.id>COALESCE(cr.last_read_message_id,0) AND ${notAutoreply}`).get(actor.id, actor.id) as { total: number | null };
     const waitingAccount = db.prepare(`SELECT r.id,r.template_name templateName,u.name customerName,u.locale customerLocale,COUNT(*) OVER () total,
       COALESCE((SELECT m.created_at FROM messages m JOIN users sender ON sender.id=m.sender_id
         WHERE m.conversation_id=c.id AND ${notAutoreply} AND sender.role='customer' ORDER BY m.id DESC LIMIT 1),r.created_at) waitingSince
@@ -1104,8 +1100,7 @@ export function buildApp({ db, origin, secureCookies = false, requireEmailVerifi
     const waitingGuest = db.prepare(`SELECT id,name customerName,template_name templateName,created_at waitingSince,COUNT(*) OVER () total
       FROM guest_requests WHERE status='new' ORDER BY created_at ASC,id ASC LIMIT 5`).all() as Array<{ id: string; templateName: string | null; customerName: string; waitingSince: string; total: number }>;
     const emailProblems = (db.prepare("SELECT COUNT(*) count FROM email_notifications WHERE status IN ('pending','failed')").get() as { count: number }).count;
-    const integrity = db.pragma('quick_check', { simple: true });
-    const foreignKeys = (db.pragma('foreign_key_check') as unknown[]).length;
+    const { integrity, foreignKeyViolations: foreignKeys } = integrityReport(false);
     const recentAudit = db.prepare(`SELECT a.id,a.action,a.entity_type entityType,a.entity_id entityId,a.created_at createdAt,u.name actorName
       FROM audit_log a JOIN users u ON u.id=a.actor_id ORDER BY a.created_at DESC,a.rowid DESC LIMIT 6`).all();
     const number = (value: number | null | undefined) => Number(value ?? 0);

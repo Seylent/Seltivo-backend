@@ -2,7 +2,7 @@ import type { FastifyInstance } from 'fastify';
 
 type Handler = (request: any, reply: Reply, payload?: unknown) => unknown | Promise<unknown>;
 type ErrorHandler = (error: unknown, request: any, reply: Reply) => unknown | Promise<unknown>;
-type Route = { method: string; pattern: RegExp; names: string[]; handler: Handler };
+type Route = { method: string; path: string; pattern: RegExp; names: string[]; handler: Handler };
 
 class Reply {
   statusCode = 200;
@@ -26,7 +26,7 @@ export function createWorkerRouter(): FastifyInstance {
       if (segment.startsWith(':')) { names.push(segment.slice(1)); return '([^/]+)'; }
       return segment.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
     }).join('/')}/?$`);
-    routes.push({ method, pattern, names, handler });
+    routes.push({ method, path, pattern, names, handler });
   };
   const router = {
     log: { error: (...args: unknown[]) => console.error(...args) },
@@ -49,6 +49,8 @@ export function createWorkerRouter(): FastifyInstance {
           url: input.url,
           headers,
           ip: headers['cf-connecting-ip'] ?? '127.0.0.1',
+          // Як у Fastify: шаблон маршруту для rate-limit bucket-ів.
+          routeOptions: { url: route.path },
           params: {} as Record<string, string>,
           query: Object.fromEntries(url.searchParams),
           body: undefined as unknown,

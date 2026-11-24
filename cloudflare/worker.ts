@@ -3,8 +3,9 @@ import { randomUUID, timingSafeEqual } from 'node:crypto';
 import { buildApp } from '../src/app.js';
 import { openCloudflareDatabase } from '../src/cloudflare-db.js';
 import { createWorkerRouter } from './worker-router.js';
-import { purgeCustomer } from '../src/delete-account.js';
-import { createLogicalBackup, restoreLogicalBackup } from '../src/logical-backup.js';
+import { purgeCustomer, purgeRequest } from '../src/delete-account.js';
+import { createLogicalBackupWithRetry, restoreLogicalBackup } from '../src/logical-backup.js';
+import { createNotificationDelivery } from '../src/notifications.js';
 import { pruneExpiredBackups } from '../src/backup-retention.js';
 import { runStagingRestoreCheck } from './staging-restore.js';
 import { hashPassword, isValidPasswordHash, normalizeEmail, now } from '../src/auth.js';
@@ -106,6 +107,7 @@ export class SeltivoData extends DurableObject<Env> {
   private ledger: DurableObjectStub;
   private restoreProbe: boolean;
   private preBodyWrites = new Map<string, number[]>();
+  private notifications: ReturnType<typeof createNotificationDelivery>;
 
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
@@ -162,6 +164,17 @@ export class SeltivoData extends DurableObject<Env> {
         throw error;
       }
     };
+    // Заявку видаляємо лише після запису в журнал: після PITR її повторно видалить replay.
+    const recordRequestDeletion = async (requestId: string) => {
+      await ledgerFetch(ledger, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ id: requestId, kind: 'request' }),
+      });
+    };
+    this.notifications = createNotificationDelivery({
+      db, origin: env.SELTIVO_PUBLIC_ORIGIN, sendMail, log: (entry) => console.error(JSON.stringify(entry)),
+    });
     this.app = buildApp({
       db,
       origin: env.SELTIVO_PUBLIC_ORIGIN,
@@ -174,6 +187,7 @@ export class SeltivoData extends DurableObject<Env> {
       teamEmail: env.SELTIVO_ADMIN_EMAIL,
       databaseBytes: () => ctx.storage.sql.databaseSize,
       deleteCustomer,
+      recordRequestDeletion,
       selfServiceDeletionEnabled: env.SELTIVO_ACCOUNT_DELETION_ENABLED === '1',
     });
   }
@@ -182,16 +196,20 @@ export class SeltivoData extends DurableObject<Env> {
   // from starting. A ledger read failure still throws (fail closed).
   private async replayDeletions(): Promise<boolean> {
     const response = await ledgerFetch(this.ledger);
-    const { ids } = await response.json() as { ids: string[] };
+    const { ids, requestIds = [] } = await response.json() as { ids: string[]; requestIds?: string[] };
     let failed = 0;
-    for (const id of ids) {
-      try {
-        purgeCustomer(this.db, id);
-      } catch (error) {
-        failed += 1;
-        console.error(JSON.stringify({ event: 'deletion_replay_failed', ...errorDetails(error) }));
+    const replay = (purge: (db: SeltivoDb, id: string) => void, list: string[]) => {
+      for (const id of list) {
+        try {
+          purge(this.db, id);
+        } catch (error) {
+          failed += 1;
+          console.error(JSON.stringify({ event: 'deletion_replay_failed', ...errorDetails(error) }));
+        }
       }
-    }
+    };
+    replay(purgeCustomer, ids);
+    replay(purgeRequest, requestIds);
     return failed === 0;
   }
 
@@ -232,9 +250,9 @@ export class SeltivoData extends DurableObject<Env> {
         signal: AbortSignal.timeout(LEDGER_TIMEOUT_MS),
       });
       if (!ledgerResponse.ok) return new Response(null, { status: 503 });
-      const { ids } = await ledgerResponse.json() as { ids: string[] };
+      const { ids, requestIds = [] } = await ledgerResponse.json() as { ids: string[]; requestIds?: string[] };
       try {
-        const manifest = await restoreLogicalBackup(this.db, this.backupBucket, body.manifestKey, ids, this.env.SELTIVO_BACKUP_ENCRYPTION_KEY);
+        const manifest = await restoreLogicalBackup(this.db, this.backupBucket, body.manifestKey, ids, this.env.SELTIVO_BACKUP_ENCRYPTION_KEY, requestIds);
         const quickCheck = this.db.pragma('quick_check') as string;
         if (quickCheck !== 'ok') throw new Error('Staging quick_check failed');
         return Response.json({ rows: Object.values(manifest.rowCounts).reduce((sum, count) => sum + count, 0), quickCheck });
@@ -265,14 +283,24 @@ export class SeltivoData extends DurableObject<Env> {
         return Response.json({ error: 'Backup encryption key is not configured' }, { status: 500 });
       }
       try {
-        const result = await createLogicalBackup(this.db, this.backupBucket, undefined, this.env.SELTIVO_BACKUP_ENCRYPTION_KEY);
+        const result = await createLogicalBackupWithRetry(this.db, this.backupBucket, undefined, this.env.SELTIVO_BACKUP_ENCRYPTION_KEY);
         console.log(JSON.stringify({ event: 'backup_completed', requestId, durationMs: Date.now() - started,
-          bytes: result.bytes, databaseBytes: this.ctx.storage.sql.databaseSize }));
+          bytes: result.bytes, attempts: result.attempts, databaseBytes: this.ctx.storage.sql.databaseSize }));
         return Response.json({ key: result.key, bytes: result.bytes });
       } catch (error) {
         console.error(JSON.stringify({ event: 'backup_failed', requestId, durationMs: Date.now() - started,
           errorType: error instanceof Error ? error.name : 'unknown' }));
         return Response.json({ error: 'Backup failed' }, { status: 500 });
+      }
+    }
+    if (url.pathname === '/internal/email-retry' && request.method === 'POST' && !this.restoreProbe) {
+      try {
+        const result = await this.notifications.retryDue();
+        console.log(JSON.stringify({ event: 'email_retry_completed', requestId, durationMs: Date.now() - started, ...result }));
+        return Response.json(result);
+      } catch (error) {
+        console.error(JSON.stringify({ event: 'email_retry_failed', requestId, ...errorDetails(error) }));
+        return Response.json({ error: 'Email retry failed' }, { status: 500 });
       }
     }
     // Відсікаємо явний flood ще до читання тіла (див. preBodyAllow).
@@ -399,13 +427,18 @@ export default {
   async scheduled(controller: ScheduledController, env: Env) {
     if (controller.cron === '10 * * * *') {
       const started = Date.now();
+      // Повтор листів не має блокувати очищення копій (і навпаки): виконуємо обидва.
+      let failure: unknown;
       try {
         const deleted = await pruneExpiredBackups(env.SELTIVO_BACKUP_BUCKET);
         console.log(JSON.stringify({ event: 'backup_retention_completed', deleted, durationMs: Date.now() - started }));
       } catch (error) {
         console.error(JSON.stringify({ event: 'backup_retention_failed', errorType: error instanceof Error ? error.name : 'unknown' }));
-        throw error;
+        failure = error;
       }
+      const retry = await env.SELTIVO.get(env.SELTIVO.idFromName('primary')).fetch(new Request('https://internal.seltivo/internal/email-retry', { method: 'POST' }));
+      if (!retry.ok) failure ??= new Error('Email retry failed');
+      if (failure) throw failure;
       return;
     }
     if (controller.cron !== '0 2 * * *') throw new Error('Unknown scheduled job');

@@ -234,3 +234,48 @@ test('deletion ledger accepts canonical UUIDs v1-v5 with a valid variant', async
     'customer:550e8400-e29b-41d4-a716-446655440000',
   ]);
 });
+
+test('deletion ledger stores request deletions separately and lists them for replay', async () => {
+  const stored = new Map<string, string>();
+  const ctx = {
+    storage: {
+      async list({ prefix }: { prefix: string }) {
+        const keys = [...stored.keys()].filter((key) => key.startsWith(prefix));
+        return { keys: () => keys };
+      },
+      async put(key: string, value: string) { stored.set(key, value); },
+    },
+  };
+  const ledger = new (DeletionLedger as any)(ctx, {}) as { fetch(request: Request): Promise<Response> };
+  const post = (body: unknown) => ledger.fetch(new Request('https://ledger.internal/deletions', {
+    method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body),
+  }));
+  const customer = '550e8400-e29b-41d4-a716-446655440000';
+  const request = '650e8400-e29b-41d4-a716-446655440001';
+  assert.equal((await post({ id: customer })).status, 204);
+  assert.equal((await post({ id: request, kind: 'request' })).status, 204);
+  assert.equal((await post({ id: request, kind: 'unknown' })).status, 422);
+  const listed = await (await ledger.fetch(new Request('https://ledger.internal/deletions'))).json();
+  assert.deepEqual(listed, { ids: [customer], requestIds: [request] });
+});
+
+test('replayDeletions also purges deleted requests', async () => {
+  const statements: { sql: string; values: unknown[] }[] = [];
+  const db = {
+    transaction<T>(callback: () => T) { return () => callback(); },
+    prepare(sql: string) {
+      return {
+        get() { return undefined; },
+        all() { return []; },
+        run(...values: unknown[]) { statements.push({ sql, values }); return { changes: 1 }; },
+      };
+    },
+    pragma() { return []; },
+  };
+  const request = '650e8400-e29b-41d4-a716-446655440001';
+  const instance = Object.create((SeltivoData as any).prototype) as any;
+  instance.db = db;
+  instance.ledger = { fetch: async () => Response.json({ ids: [], requestIds: [request] }) };
+  assert.equal(await instance.replayDeletions(), true);
+  assert.ok(statements.some((entry) => entry.sql.includes('DELETE FROM requests WHERE id=?') && entry.values[0] === request));
+});

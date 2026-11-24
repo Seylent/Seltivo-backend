@@ -1,7 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import type { SeltivoDb } from './db.js';
 import { MIGRATIONS } from './schema.js';
-import { purgeCustomer } from './delete-account.js';
+import { purgeCustomer, purgeRequest } from './delete-account.js';
 
 const tables = [
   'users', 'sessions', 'auth_tokens', 'configurations', 'requests',
@@ -38,7 +38,7 @@ function version(db: SeltivoDb): number {
 
 function assertSchema(db: SeltivoDb): void {
   if (version(db) !== latestVersion) throw new Error('Backup schema version does not match application');
-  const actual = (db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' AND name NOT IN ('schema_migrations','__miniflare_do_name') AND substr(name,1,5) != '__cf_' AND substr(name,1,4) != '_cf_'").all() as { name: string }[])
+  const actual = (db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' AND name NOT IN ('schema_migrations','rate_limit_hits','__miniflare_do_name') AND substr(name,1,5) != '__cf_' AND substr(name,1,4) != '_cf_'").all() as { name: string }[])
     .map((row) => row.name).sort();
   if (JSON.stringify(actual) !== JSON.stringify([...tables].sort())) throw new Error('Backup table inventory does not match application');
 }
@@ -87,14 +87,21 @@ async function aesGcmKey(raw: Uint8Array): Promise<CryptoKey> {
   return crypto.subtle.importKey('raw', new Uint8Array(raw), { name: 'AES-GCM' }, false, ['encrypt', 'decrypt']);
 }
 
-function rowsFor(db: SeltivoDb, table: Table, limit: number, offset: number): Row[] {
-  const rows = db.prepare(`SELECT * FROM ${table} ORDER BY rowid LIMIT ? OFFSET ?`).all(limit, offset) as Row[];
+// Keyset-пагінація за rowid: OFFSET змушував SQLite щоразу проходити всі попередні
+// рядки, і копія великої таблиці ставала квадратичною за часом.
+function rowsAfter(db: SeltivoDb, table: Table, limit: number, afterRowid: number): { rows: Row[]; lastRowid: number } {
+  const raw = db.prepare(`SELECT rowid AS __backup_rowid, * FROM ${table} WHERE rowid>? ORDER BY rowid LIMIT ?`).all(afterRowid, limit) as Row[];
+  let lastRowid = afterRowid;
+  const rows = raw.map(({ __backup_rowid, ...row }) => {
+    lastRowid = Number(__backup_rowid);
+    return row;
+  });
   for (const row of rows) {
     if (Object.values(row).some((value) => value !== null && (typeof value !== 'string' && (typeof value !== 'number' || !Number.isFinite(value))))) {
       throw new Error(`Unsupported backup value in ${table}`);
     }
   }
-  return rows;
+  return { rows, lastRowid };
 }
 
 // Each chunk is independent and the manifest is written only after a consistent read.
@@ -135,39 +142,43 @@ export async function createLogicalBackup(db: SeltivoDb, store: Store, at = new 
     if (table === 'configurations' || table === 'requests') {
       let chunkRows: Row[] = [];
       let chunkBytes = 2;
-      let chunkStartOffset = 0;
-      for (let offset = 0; ; offset += 1) {
-        const rows = rowsFor(db, table, 1, offset);
-        if (!rows.length) break;
-        const row = rows[0];
+      let chunkStartIndex = 0;
+      let index = 0;
+      for (let afterRowid = 0; ;) {
+        const page = rowsAfter(db, table, 1, afterRowid);
+        if (!page.rows.length) break;
+        afterRowid = page.lastRowid;
+        const row = page.rows[0];
         const rowBytes = encoder.encode(JSON.stringify(row)).byteLength + 1;
         if (rowBytes + 2 > maxChunkBytes) throw new Error(`Backup chunk too large: ${table}`);
         if (chunkRows.length > 0 && (chunkBytes + rowBytes > targetChunkBytes || chunkRows.length >= 50)) {
-          await flushChunk(table, chunkStartOffset, chunkRows);
+          await flushChunk(table, chunkStartIndex, chunkRows);
           chunkRows = [];
           chunkBytes = 2;
-          chunkStartOffset = offset;
+          chunkStartIndex = index;
         }
         chunkRows.push(row);
         chunkBytes += rowBytes;
+        index += 1;
       }
-      if (chunkRows.length > 0) await flushChunk(table, chunkStartOffset, chunkRows);
+      if (chunkRows.length > 0) await flushChunk(table, chunkStartIndex, chunkRows);
     } else {
       const limit = 100;
-      for (let offset = 0; ; offset += limit) {
-        const rows = rowsFor(db, table, limit, offset);
-        if (!rows.length) break;
-        await flushChunk(table, offset, rows);
+      for (let afterRowid = 0, index = 0; ; index += limit) {
+        const page = rowsAfter(db, table, limit, afterRowid);
+        if (!page.rows.length) break;
+        afterRowid = page.lastRowid;
+        await flushChunk(table, index, page.rows);
       }
     }
   }
-  if (changes(db) !== startedAt) throw new Error('Database changed during backup; no manifest published');
+  if (changes(db) !== startedAt) throw new Error(CONCURRENT_WRITE);
   const key = `${base}manifest.json`;
   await store.put(key, JSON.stringify(manifest));
   return { key, manifest, bytes: totalBytes };
 }
 
-export async function restoreLogicalBackup(db: SeltivoDb, store: Store, manifestKey: string, deletedIds: Iterable<string> = [], encryptionKey?: string): Promise<BackupManifest> {
+export async function restoreLogicalBackup(db: SeltivoDb, store: Store, manifestKey: string, deletedIds: Iterable<string> = [], encryptionKey?: string, deletedRequestIds: Iterable<string> = []): Promise<BackupManifest> {
   if (!manifestKeyPattern.test(manifestKey)) throw new Error('Invalid backup manifest key');
   assertSchema(db);
   const object = await store.get(manifestKey);
@@ -230,6 +241,7 @@ export async function restoreLogicalBackup(db: SeltivoDb, store: Store, manifest
     if (actualCounts[table] !== manifest.rowCounts?.[table]) throw new Error('Backup table row count mismatch');
   }
   for (const id of deletedIds) purgeCustomer(db, id);
+  for (const id of deletedRequestIds) purgeRequest(db, id);
   // v9 was a data-only migration: backups taken before it still carry verified
   // customers and their live sessions. Replay its effect so an old backup cannot
   // restore verification or sessions that migration v9 intentionally revoked.
@@ -242,4 +254,21 @@ export async function restoreLogicalBackup(db: SeltivoDb, store: Store, manifest
   }
   if ((db.pragma('foreign_key_check') as unknown[]).length) throw new Error('Foreign key violation after backup restore');
   return manifest;
+}
+
+const CONCURRENT_WRITE = 'Database changed during backup; no manifest published';
+
+/**
+ * Будь-який запис під час експорту (вхід, повідомлення) скасовує копію. Повторюємо
+ * лише цю ситуацію; інші помилки (ключ, схема, R2) одразу йдуть в алерти.
+ */
+export async function createLogicalBackupWithRetry(db: SeltivoDb, store: Store, at = new Date(), encryptionKey?: string, { attempts = 3, delayMs = 5_000 }: { attempts?: number; delayMs?: number } = {}): Promise<{ key: string; manifest: BackupManifest; bytes: number; attempts: number }> {
+  for (let attempt = 1; ; attempt += 1) {
+    try {
+      return { ...await createLogicalBackup(db, store, at, encryptionKey), attempts: attempt };
+    } catch (error) {
+      if (attempt >= attempts || !(error instanceof Error) || error.message !== CONCURRENT_WRITE) throw error;
+      if (delayMs > 0) await new Promise((resolve) => setTimeout(resolve, delayMs));
+    }
+  }
 }
