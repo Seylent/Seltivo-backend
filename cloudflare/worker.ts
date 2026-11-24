@@ -1,12 +1,14 @@
 import { DurableObject } from 'cloudflare:workers';
-import { randomUUID, timingSafeEqual } from 'node:crypto';
+import { createHash, randomUUID, timingSafeEqual } from 'node:crypto';
 import { buildApp } from '../src/app.js';
 import { openCloudflareDatabase } from '../src/cloudflare-db.js';
 import { createWorkerRouter } from './worker-router.js';
 import { purgeCustomer, purgeRequest } from '../src/delete-account.js';
 import { createLogicalBackupWithRetry, restoreLogicalBackup } from '../src/logical-backup.js';
+import { createR2Backup } from '../src/r2-backup.js';
 import { createNotificationDelivery } from '../src/notifications.js';
 import { pruneExpiredBackups } from '../src/backup-retention.js';
+import { checkR2Restore } from './staging-r2-restore.js';
 import { runStagingRestoreCheck } from './staging-restore.js';
 import { hashPassword, isValidPasswordHash, normalizeEmail, now } from '../src/auth.js';
 import type { SeltivoDb } from '../src/db.js';
@@ -61,6 +63,7 @@ interface Env {
   SELTIVO: DurableObjectNamespace;
   SELTIVO_DELETIONS: DurableObjectNamespace;
   SELTIVO_BACKUP_BUCKET: R2Bucket;
+  SELTIVO_SITE_DATA: R2Bucket;
   SELTIVO_PUBLIC_ORIGIN: string;
   SELTIVO_ADMIN_EMAIL: string;
   SELTIVO_ADMIN_PASSWORD_HASH?: string;
@@ -104,6 +107,7 @@ export class SeltivoData extends DurableObject<Env> {
   private app: ReturnType<typeof buildApp>;
   private db: SeltivoDb;
   private backupBucket: R2Bucket;
+  private siteBucket: R2Bucket;
   private ledger: DurableObjectStub;
   private restoreProbe: boolean;
   private preBodyWrites = new Map<string, number[]>();
@@ -116,6 +120,7 @@ export class SeltivoData extends DurableObject<Env> {
     const db = openCloudflareDatabase(ctx.storage);
     this.db = db;
     this.backupBucket = env.SELTIVO_BACKUP_BUCKET;
+    this.siteBucket = env.SELTIVO_SITE_DATA;
     const ledger = env.SELTIVO_DELETIONS.get(env.SELTIVO_DELETIONS.idFromName('primary'));
     this.ledger = ledger;
     this.restoreProbe = stagingControlsEnabled(env) && ctx.id.name?.startsWith('restore-check-') === true;
@@ -275,6 +280,15 @@ export class SeltivoData extends DurableObject<Env> {
         .run(randomUUID(), normalizeEmail(body.email), await hashPassword(body.password), timestamp, timestamp, timestamp);
       return new Response(null, { status: 201 });
     }
+    if (stagingControlsEnabled(this.env) && url.pathname === '/internal/r2-restore-check' && request.method === 'POST') {
+      const body = await request.json().catch(() => null) as { manifestKey?: unknown } | null;
+      if (typeof body?.manifestKey !== 'string') return new Response(null, { status: 422 });
+      try { return Response.json(await checkR2Restore(this.backupBucket, this.siteBucket, body.manifestKey)); }
+      catch (error) {
+        console.error(JSON.stringify({ event: 'r2_restore_check_failed', ...errorDetails(error) }));
+        return Response.json({ error: 'R2 restore check failed' }, { status: 500 });
+      }
+    }
     if (url.pathname === '/internal/backup' && request.method === 'POST') {
       // Backups contain password hashes and admin TOTP secrets — never write them
       // to R2 in plaintext. Legacy plaintext backups remain readable on restore.
@@ -284,9 +298,22 @@ export class SeltivoData extends DurableObject<Env> {
       }
       try {
         const result = await createLogicalBackupWithRetry(this.db, this.backupBucket, undefined, this.env.SELTIVO_BACKUP_ENCRYPTION_KEY);
+        const site = await createR2Backup(this.siteBucket, this.backupBucket);
+        // Publish the service manifest only after the SQLite copy, R2 snapshot
+        // and deletion-ledger IDs are all safely stored.
+        const ledgerData = await (await ledgerFetch(this.ledger)).text();
+        const ledgerKey = result.key.replace('manifest.json', 'deletion-ledger.json');
+        await this.backupBucket.put(ledgerKey, ledgerData);
+        const serviceManifest = result.key.replace('manifest.json', 'service-manifest.json');
+        await this.backupBucket.put(serviceManifest, JSON.stringify({
+          format: 'seltivo-service-v1', createdAt: new Date().toISOString(),
+          databaseManifest: result.key, r2Manifest: site.key,
+          deletionLedger: { key: ledgerKey, sha256: createHash('sha256').update(ledgerData).digest('hex') },
+        }));
         console.log(JSON.stringify({ event: 'backup_completed', requestId, durationMs: Date.now() - started,
-          bytes: result.bytes, attempts: result.attempts, databaseBytes: this.ctx.storage.sql.databaseSize }));
-        return Response.json({ key: result.key, bytes: result.bytes });
+          bytes: result.bytes + site.bytes, siteObjects: site.manifest.objects.length,
+          attempts: result.attempts, databaseBytes: this.ctx.storage.sql.databaseSize }));
+        return Response.json({ key: result.key, bytes: result.bytes + site.bytes, serviceManifest, r2Manifest: site.key });
       } catch (error) {
         console.error(JSON.stringify({ event: 'backup_failed', requestId, durationMs: Date.now() - started,
           errorType: error instanceof Error ? error.name : 'unknown' }));
@@ -406,6 +433,12 @@ export default {
       if (path === '/internal/staging/admin-fixture') {
         const id = env.SELTIVO.idFromName('primary');
         return env.SELTIVO.get(id).fetch(new Request('https://internal.seltivo/internal/admin-fixture', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' }, body: await request.text(),
+        }));
+      }
+      if (path === '/internal/staging/r2-restore-check') {
+        const id = env.SELTIVO.idFromName('primary');
+        return env.SELTIVO.get(id).fetch(new Request('https://internal.seltivo/internal/r2-restore-check', {
           method: 'POST', headers: { 'Content-Type': 'application/json' }, body: await request.text(),
         }));
       }

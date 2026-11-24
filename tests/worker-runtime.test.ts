@@ -62,7 +62,7 @@ before(async () => {
       SELTIVO: { className: 'SeltivoData', useSQLite: true },
       SELTIVO_DELETIONS: { className: 'DeletionLedger', useSQLite: true },
     },
-    r2Buckets: ['SELTIVO_BACKUP_BUCKET'],
+    r2Buckets: ['SELTIVO_BACKUP_BUCKET', 'SELTIVO_SITE_DATA'],
     log: new Log(LogLevel.ERROR),
   }));
 });
@@ -157,7 +157,7 @@ test('a Worker without the backup encryption key refuses to write plaintext back
       SELTIVO: { className: 'SeltivoData', useSQLite: true },
       SELTIVO_DELETIONS: { className: 'DeletionLedger', useSQLite: true },
     },
-    r2Buckets: ['SELTIVO_BACKUP_BUCKET'],
+    r2Buckets: ['SELTIVO_BACKUP_BUCKET', 'SELTIVO_SITE_DATA'],
     log: new Log(LogLevel.ERROR),
   }));
   try {

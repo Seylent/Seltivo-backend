@@ -24,10 +24,11 @@ jobs:
           cache: npm
           cache-dependency-path: package-lock.json
       - run: npm ci
+      - run: npm audit --audit-level=moderate
+      - run: npm run cf:types:check
       - run: npm run typecheck
       - run: npm test
       - run: node --import tsx --test tests/config.test.ts
       - run: npm run build
-      - run: npm audit --omit=dev --audit-level=high
       - run: npx wrangler deploy --dry-run --env=""
       - run: npx wrangler deploy --dry-run --env staging

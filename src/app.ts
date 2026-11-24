@@ -9,6 +9,7 @@ import { createChatEvents } from './chat-events.js';
 import { renderEmail } from './emails.js';
 import { accountPayloadBytes, defaultDataLimits, exportAccount, type DataLimits } from './data-controls.js';
 import { createNotificationDelivery, type Mail } from './notifications.js';
+import { retention } from './admin-retention.js';
 
 const id = z.uuid();
 const email = z.email().max(254);
@@ -1021,6 +1022,14 @@ export function buildApp({ db, origin, secureCookies = false, requireEmailVerifi
     })();
     chatEvents.publish(row.customer_id, { kind: 'status', requestId: row.id });
     return { id: row.id, status: 'reviewing', statusVersion: version + 1 };
+  });
+  app.post('/api/v1/admin/retention', async (request, reply) => {
+    const actor = auth(request, reply, 'admin'); if (!actor) return;
+    const body = parse(z.object({ before: z.iso.datetime(), apply: z.boolean().default(false) }).strict(), request.body, reply); if (!body) return;
+    if (Date.parse(body.before) > Date.now() - 30 * 86400000) return fail(reply, 422, 'Дата очищення має бути щонайменше 30 днів тому.');
+    const result = retention(db, body.before, body.apply);
+    if (body.apply) audit(db, actor.id, 'data.retention', 'policy', body.before);
+    return result;
   });
   app.get('/api/v1/admin/audit', async (request, reply) => {
     if (!auth(request, reply, 'admin')) return;
