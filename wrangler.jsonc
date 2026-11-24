@@ -30,7 +30,10 @@
   "observability": { "enabled": true, "redact_query_string": true },
   "env": {
     "staging": {
-      "workers_dev": false,
+      // Публічний hostname потрібен: Next-проксі staging звертається до
+      // https://seltivo-api-staging.seltivostudio.workers.dev (SELTIVO_BACKEND_URL).
+      // Без нього staging віддає 503 backend_unavailable і смоуки не працюють.
+      "workers_dev": true,
       "preview_urls": false,
       "vars": {
         "SELTIVO_PUBLIC_ORIGIN": "https://seltivo-staging.seltivostudio.workers.dev",
