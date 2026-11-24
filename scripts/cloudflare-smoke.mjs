@@ -29,6 +29,15 @@ async function customer(label) {
   return login.cookie;
 }
 
+// Залежно від наявності активного адміна, при створенні заявки може з'явитися
+// автовітальне повідомлення. Перевіряємо ідемпотентність за текстом самого
+// повідомлення, а не за загальною кількістю рядків у діалозі.
+async function countMessages(cookie, requestId, body) {
+  const list = await call('GET', `/api/v1/requests/${requestId}/messages`, undefined, cookie);
+  assert.equal(list.status, 200);
+  return list.body.items.filter((item) => item.body === body).length;
+}
+
 const alice = await customer('Alice');
 const bob = await customer('Bob');
 const requestBody = { templateId: 'fashion-01', templateName: 'Fashion 01', contact: { name: 'Alice' }, clientSubmissionId: randomUUID() };
@@ -39,7 +48,7 @@ assert.equal((await call('GET', `/api/v1/requests/${first.body.id}`, undefined, 
 const message = { body: 'Cloudflare runtime check', clientMessageId: randomUUID() };
 assert.equal((await call('POST', `/api/v1/requests/${first.body.id}/messages`, message, alice)).status, 201);
 assert.equal((await call('POST', `/api/v1/requests/${first.body.id}/messages`, message, alice)).status, 200);
-assert.equal((await call('GET', `/api/v1/requests/${first.body.id}/messages`, undefined, alice)).body.items.length, 1);
+assert.equal(await countMessages(alice, first.body.id, message.body), 1);
 // Admin checks mutate state (email retry, status patch) and need an explicit opt-in,
 // not just credentials supplied "by the way".
 const adminAllowed = process.env.SELTIVO_SMOKE_ALLOW_ADMIN === '1';
@@ -56,10 +65,10 @@ if (adminAllowed && process.env.SELTIVO_SMOKE_ADMIN_EMAIL && process.env.SELTIVO
   const notification = outstanding.body.items.find((item) => item.requestId === first.body.id);
   assert.ok(notification);
   assert.equal((await call('POST', `/api/v1/admin/email-notifications/${notification.id}/retry`, {}, admin)).body.status, 'failed');
-  assert.equal((await call('GET', `/api/v1/requests/${first.body.id}/messages`, undefined, alice)).body.items.length, 1);
+  assert.equal(await countMessages(alice, first.body.id, message.body), 1);
   const reply = await call('POST', `/api/v1/requests/${first.body.id}/messages`, { body: 'Admin reply', clientMessageId: randomUUID() }, admin);
   assert.equal(reply.status, 201);
-  assert.equal((await call('GET', `/api/v1/requests/${first.body.id}/messages`, undefined, alice)).body.items.length, 2);
+  assert.equal(await countMessages(alice, first.body.id, 'Admin reply'), 1);
   const statusPath = `/api/v1/admin/requests/${first.body.id}/status`;
   assert.equal((await call('PATCH', statusPath, { status: 'reviewing' }, admin, { 'If-Match': '1' })).status, 200);
   assert.equal((await call('PATCH', statusPath, { status: 'needs_info' }, admin, { 'If-Match': '1' })).status, 409);
