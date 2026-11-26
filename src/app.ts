@@ -362,6 +362,10 @@ export function buildApp({ db, origin, secureCookies = false, requireEmailVerifi
     const body = parse(z.object({ email }).strict(), request.body, reply);
     if (!body) return;
     const normalized = normalizeEmail(body.email);
+    // Код/ресенд належить акаунту: сесія V не може надіслати лист для A.
+    // Анонімний запис лишається можливим — саме так виглядає первинна верифікація.
+    const sessionActor = actorFromRequest(db, request);
+    if (sessionActor && sessionActor.email !== normalized) return fail(reply, 403, 'Невірний акаунт для підтвердження.');
     // Per-account ліміт: per-IP легко обійти ротацією адрес. Лічимо незалежно
     // від існування акаунта, щоб відповідь не розкривала, чи email зареєстрований.
     const limitKey = `email:resend:${normalized}`;
@@ -381,10 +385,14 @@ export function buildApp({ db, origin, secureCookies = false, requireEmailVerifi
       z.object({ token: z.string().min(20).max(100) }).strict(),
     ]), request.body, reply);
     if (!body) return;
+    // Токен з URL або email із тіла не є підставою для зміни поточної сесії:
+    // інакше перехід за чужим посиланням тихо залогінив би браузер під A.
+    const sessionActor = actorFromRequest(db, request);
     let row: { user_id: string; token_hash: string } | undefined;
     if ('code' in body) {
       const normalized = normalizeEmail(body.email);
       const user = db.prepare("SELECT id FROM users WHERE email=? AND role='customer' AND disabled_at IS NULL AND email_verified_at IS NULL").get(normalized) as { id: string } | undefined;
+      if (sessionActor && sessionActor.id !== user?.id) return fail(reply, 403, 'Невірний акаунт для підтвердження.');
       const token = user && db.prepare("SELECT token_hash,attempts FROM auth_tokens WHERE user_id=? AND purpose='verify' AND expires_at>?").get(user.id, now()) as { token_hash: string; attempts: number } | undefined;
       if (token && token.attempts >= 5) return fail(reply, 429, 'Забагато спроб. Запросіть новий код.');
       if (token) {
@@ -396,6 +404,7 @@ export function buildApp({ db, origin, secureCookies = false, requireEmailVerifi
       row = db.prepare(`SELECT t.user_id,t.token_hash FROM auth_tokens t JOIN users u ON u.id=t.user_id
         WHERE t.token_hash=? AND t.purpose='verify' AND t.expires_at>? AND u.role='customer' AND u.disabled_at IS NULL`)
         .get(hashToken(body.token), now()) as typeof row;
+      if (row && sessionActor && sessionActor.id !== row.user_id) return fail(reply, 403, 'Невірний акаунт для підтвердження.');
     }
     if (!row) return fail(reply, 422, 'Код недійсний або прострочений.');
     db.transaction(() => {
@@ -546,9 +555,16 @@ export function buildApp({ db, origin, secureCookies = false, requireEmailVerifi
       recordAttempt(limitKey, 15 * 60_000);
       return fail(reply, 422, 'Невірний код.');
     }
-    const result = db.prepare('UPDATE admin_two_factor SET enabled_at=? WHERE user_id=? AND enabled_at IS NULL').run(now(), actor.id);
-    if (!result.changes) return fail(reply, 409, '2FA вже увімкнено.');
+    const enabled = db.transaction(() => {
+      const updated = db.prepare('UPDATE admin_two_factor SET enabled_at=? WHERE user_id=? AND enabled_at IS NULL').run(now(), actor.id);
+      if (!updated.changes) return false;
+      // Сесія, здобута до увімкнення другого фактора, не має лишатися адмінською.
+      db.prepare('DELETE FROM sessions WHERE user_id=?').run(actor.id);
+      return true;
+    })();
+    if (!enabled) return fail(reply, 409, '2FA вже увімкнено.');
     audit(db, actor.id, 'auth.2fa.enable', 'user', actor.id);
+    reply.header('Set-Cookie', clearSessionCookie(secureCookies));
     return { ok: true };
   });
   app.post('/api/v1/auth/2fa/disable', async (request, reply) => {
@@ -569,8 +585,13 @@ export function buildApp({ db, origin, secureCookies = false, requireEmailVerifi
       recordAttempt(limitKey, 15 * 60_000);
       return fail(reply, 422, 'Невірний код.');
     }
-    db.prepare('DELETE FROM admin_two_factor WHERE user_id=?').run(actor.id);
+    // Step-down: після зняття другого фактора сесії з асурансом більше не існують.
+    db.transaction(() => {
+      db.prepare('DELETE FROM admin_two_factor WHERE user_id=?').run(actor.id);
+      db.prepare('DELETE FROM sessions WHERE user_id=?').run(actor.id);
+    })();
     audit(db, actor.id, 'auth.2fa.disable', 'user', actor.id);
+    reply.header('Set-Cookie', clearSessionCookie(secureCookies));
     return { ok: true };
   });
   app.post('/api/v1/auth/forgot-password', async (request, reply) => {
@@ -614,7 +635,13 @@ export function buildApp({ db, origin, secureCookies = false, requireEmailVerifi
     const actor = auth(request, reply); if (!actor) return;
     const row = db.prepare('SELECT id,email,role,name,phone,telegram,locale,email_verified_at FROM users WHERE id=?').get(actor.id) as any;
     return { id: row.id, email: row.email, role: row.role, name: row.name, phone: row.phone, telegram: row.telegram, locale: row.locale,
-      emailVerified: Boolean(row.email_verified_at), accountDeletionAvailable: actor.role === 'customer' && Boolean(deleteCustomer) && selfServiceDeletionEnabled };
+      emailVerified: Boolean(row.email_verified_at),
+      // Асуранс для адмін-гейту фронту (src/lib/admin-role.ts): поля надсилаємо
+      // лише коли другий фактор реально увімкнено, щоб не ламати staging, де 2FA
+      // необов'язкова. Чинна сесія після enable створюється тільки через логін із кодом.
+      ...(actor.role === 'admin' && twoFactorRow(actor.id)?.enabled_at
+        ? { twoFactorVerified: true, assurance: 'mfa' } : {}),
+      accountDeletionAvailable: actor.role === 'customer' && Boolean(deleteCustomer) && selfServiceDeletionEnabled };
   });
   app.patch('/api/v1/me', async (request, reply) => {
     const actor = auth(request, reply); if (!actor) return;
@@ -638,8 +665,14 @@ export function buildApp({ db, origin, secureCookies = false, requireEmailVerifi
     const actor = auth(request, reply); if (!actor) return;
     const body = parse(z.object({ currentPassword: z.string().min(1).max(200), newPassword: password }).strict(), request.body, reply);
     if (!body) return;
+    // Загальний per-IP ліміт на /auth/* не захищає від вгадування пароля з багатьох IP.
+    const limitKey = `password:change:${actor.id}`;
+    if (!checkRateLimit(limitKey, 15 * 60_000, 5, reply, false)) return;
     const row = db.prepare('SELECT password_hash FROM users WHERE id=?').get(actor.id) as { password_hash: string };
-    if (!await verifyPassword(body.currentPassword, row.password_hash)) return fail(reply, 401, 'Невірний поточний пароль.');
+    if (!await verifyPassword(body.currentPassword, row.password_hash)) {
+      recordAttempt(limitKey, 15 * 60_000);
+      return fail(reply, 401, 'Невірний поточний пароль.');
+    }
     if (body.currentPassword === body.newPassword) return fail(reply, 422, 'Новий пароль має відрізнятися.');
     const hash = await hashPassword(body.newPassword);
     db.transaction(() => {
@@ -647,6 +680,7 @@ export function buildApp({ db, origin, secureCookies = false, requireEmailVerifi
       db.prepare("DELETE FROM auth_tokens WHERE user_id=? AND purpose='reset'").run(actor.id);
       db.prepare('DELETE FROM sessions WHERE user_id=?').run(actor.id);
     })();
+    clearRateLimit(limitKey);
     reply.header('Set-Cookie', clearSessionCookie(secureCookies));
     return { ok: true };
   });

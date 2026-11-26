@@ -62,9 +62,14 @@ test('admin enrolls in 2FA, login requires a code, and the session is capped at 
 
     const enrolled = await enroll(app, admin.cookie);
     assert.match(enrolled.uri, /^otpauth:\/\/totp\/SELTIVO%3Aadmin%40example\.test/);
-    const statusAfter = await call(app, 'GET', '/api/v1/auth/2fa/status', undefined, admin.cookie);
+    // The pre-enrollment session is retired; the next one must carry a second factor.
+    assert.equal((await call(app, 'GET', '/api/v1/auth/2fa/status', undefined, admin.cookie)).status, 401);
+    const fresh = await call(app, 'POST', '/api/v1/auth/login', { email: admin.email, password, code: enrolled.recoveryCodes[0] });
+    assert.equal(fresh.status, 200);
+    const freshCookie = fresh.cookie!.split(';')[0];
+    const statusAfter = await call(app, 'GET', '/api/v1/auth/2fa/status', undefined, freshCookie);
     assert.equal(statusAfter.body.enabled, true);
-    assert.equal(statusAfter.body.recoveryCodesRemaining, 8);
+    assert.equal(statusAfter.body.recoveryCodesRemaining, 7);
 
     const missing = await call(app, 'POST', '/api/v1/auth/login', { email: admin.email, password });
     assert.equal(missing.status, 428);
@@ -80,14 +85,15 @@ test('admin enrolls in 2FA, login requires a code, and the session is capped at 
     const session = db.prepare('SELECT expires_at FROM sessions WHERE user_id=(SELECT id FROM users WHERE email=?)').get(admin.email) as { expires_at: string };
     assert.ok(Date.parse(session.expires_at) - Date.now() <= 12 * 60 * 60 * 1000);
 
-    const remembered = await call(app, 'POST', '/api/v1/auth/login', { email: admin.email, password, rememberMe: true, code: enrolled.recoveryCodes[0] });
+    const remembered = await call(app, 'POST', '/api/v1/auth/login', { email: admin.email, password, rememberMe: true, code: enrolled.recoveryCodes[1] });
     assert.equal(remembered.status, 200);
     assert.match(String(remembered.cookie), /Max-Age=43200/);
     assert.doesNotMatch(String(remembered.cookie), /Max-Age=2592000/);
 
-    const disabled = await call(app, 'POST', '/api/v1/auth/2fa/disable', { password, code: enrolled.recoveryCodes[1] }, admin.cookie);
+    const disabled = await call(app, 'POST', '/api/v1/auth/2fa/disable', { password, code: enrolled.recoveryCodes[2] }, freshCookie);
     assert.equal(disabled.status, 200);
-    assert.equal((await call(app, 'GET', '/api/v1/auth/2fa/status', undefined, admin.cookie)).body.enabled, false);
+    // Disabling is a step-down: even the second-factor session is revoked.
+    assert.equal((await call(app, 'GET', '/api/v1/auth/2fa/status', undefined, freshCookie)).status, 401);
     assert.equal((await call(app, 'POST', '/api/v1/auth/login', { email: admin.email, password })).status, 200);
   } finally {
     await app.close();
@@ -101,6 +107,9 @@ test('concurrent logins cannot mint two sessions from one recovery code', async 
   try {
     const admin = await addAdmin(db, app, 'admin@example.test');
     const enrolled = await enroll(app, admin.cookie);
+    const reauthenticated = await call(app, 'POST', '/api/v1/auth/login', { email: admin.email, password, code: totpAt(enrolled.secret, Date.now() + 30_000) });
+    assert.equal(reauthenticated.status, 200);
+    const assuredCookie = reauthenticated.cookie!.split(';')[0];
     const recovery = enrolled.recoveryCodes[0];
     const results = await Promise.all([
       call(app, 'POST', '/api/v1/auth/login', { email: admin.email, password, code: recovery }),
@@ -108,7 +117,7 @@ test('concurrent logins cannot mint two sessions from one recovery code', async 
     ]);
     assert.equal(results.filter((result) => result.status === 200).length, 1,
       'a single-use recovery code may create at most one new session');
-    assert.equal((await call(app, 'GET', '/api/v1/auth/2fa/status', undefined, admin.cookie)).body.recoveryCodesRemaining, 7);
+    assert.equal((await call(app, 'GET', '/api/v1/auth/2fa/status', undefined, assuredCookie)).body.recoveryCodesRemaining, 7);
   } finally {
     await app.close();
     db.close();
@@ -124,7 +133,8 @@ test('a recovery code works once and 2FA endpoints are admin-only', async () => 
     const recovery = enrolled.recoveryCodes[0];
     const first = await call(app, 'POST', '/api/v1/auth/login', { email: admin.email, password, code: recovery });
     assert.equal(first.status, 200);
-    const status = await call(app, 'GET', '/api/v1/auth/2fa/status', undefined, admin.cookie);
+    const assuredCookie = first.cookie!.split(';')[0];
+    const status = await call(app, 'GET', '/api/v1/auth/2fa/status', undefined, assuredCookie);
     assert.equal(status.body.recoveryCodesRemaining, 7);
     const replay = await call(app, 'POST', '/api/v1/auth/login', { email: admin.email, password, code: recovery });
     assert.equal(replay.status, 401);
